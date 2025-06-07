@@ -36,3 +36,18 @@
     transform: rotate(360deg);
   }
 }
+
+/* Устанавливаем курсор по умолчанию для всей области карты */
+.leaflet-container {
+  cursor: default !important;
+}
+
+/* Устанавливаем курсор для режима перетаскивания карты */
+.leaflet-grab {
+  cursor: default !important; /* Курсор по умолчанию (стрелка) */
+}
+
+/* Устанавливаем курсор для активного перетаскивания карты */
+.leaflet-grabbing {
+  cursor: default !important; /* Курсор по умолчанию (стрелка) */
+}

@@ -16,18 +16,65 @@ interface FiberStructure {
   fiberColor: { name: string; color: string; border?: string };
 }
 
+// Тип для сплиттера
+interface Splitter {
+  id: string; // Уникальный ID для сплиттера внутри бокса (например, 'splitter-1-level1', 'splitter-2-level2-a')
+  type: '1x2' | '1x4' | '1x8' | '1x16'; // Тип сплиттера
+  hasConnector: boolean; // Наличие коннектора (true/false)
+  level: 1 | 2 | 3; // Уровень сплиттера: 1-й, 2-й, 3-й
+  number: string; // НОВОЕ ПОЛЕ: номер сплиттера для отображения (вручную)
+}
+
+// Тип для точки соединения (волокно кабеля или порт сплиттера)
+type ConnectionPoint =
+  | { type: 'cableFiber'; cableId: string; fiberIdx: number; direction: 'in' | 'out' }
+  | { type: 'splitterPort'; splitterId: string; portType: 'input' | 'output'; portIdx: number };
+
+// Тип для внутреннего соединения в боксе
+interface InternalConnection {
+  end1: ConnectionPoint;
+  end2: ConnectionPoint;
+}
+
+// Константы для потерь сплиттеров
+const SPLITTER_LOSSES: Record<Splitter['type'], number> = {
+  '1x2': 4.3,
+  '1x4': 7.4,
+  '1x8': 10.7,
+  '1x16': 13.9,
+};
+
+// Функция для определения количества портов сплиттера
+function getSplitterPortCounts(type: Splitter['type']): { input: number; outputs: number } {
+  switch (type) {
+    case '1x2': return { input: 1, outputs: 2 };
+    case '1x4': return { input: 1, outputs: 4 };
+    case '1x8': return { input: 1, outputs: 8 };
+    case '1x16': return { input: 1, outputs: 16 };
+    default: return { input: 0, outputs: 0 }; // Должен быть недостижим с типизацией
+  }
+}
+
 // Тип для бокса
 interface Box {
   id: number;
   position: [number, number];
   number: string;
-  splitter: string;
   address: string;
   place: string;
   connections: {
     input: { cableId: number } | null;
     outputs: Array<{ cableId: number } | null>;
   };
+  splitters: Splitter[];
+  internalFiberConnections: InternalConnection[];
+  status: 'existing' | 'projected'; // Состояние: существующий или проектируемый
+  oltTerminalNo: string; // Номер терминала OLT
+  oltPortNo: string;     // Номер порта OLT
+  // НОВОЕ ПОЛЕ: Модель бокса
+  model: 'FOB-02-04-04LC' | 'FOB-03-12-08LC' | 'FOB-04-16-16LC' | 'FOB-05-24-24LC' |
+         'FOB-02-04-04SC' | 'FOB-03-12-08SC' | 'FOB-04-16-16SC' | 'FOB-05-24-24SC' |
+         'FOB-05-24';
 }
 
 // Тип для кабеля
@@ -46,18 +93,13 @@ interface CableDetailDialogProps {
   onClose: () => void;
   cables: Cable[];
   boxes: Box[];
-  fiberConnections: {
-    end1: { cableId: string; fiberIdx: number };
-    end2: { cableId: string; fiberIdx: number };
-  }[];
-  selectedFiber: {
-    cableId: string;
-    fiberIdx: number;
-    direction: 'in' | 'out';
-  } | null;
-  onFiberClick: (cableId: string, fiberIdx: number, direction: 'in' | 'out') => void;
+  fiberConnections: InternalConnection[]; // Обновляем тип (это глобальные внешние соединения)
+  selectedConnectionPoint: ConnectionPoint | null;
+  onConnectionPointClick: (point: ConnectionPoint) => void;
   onRemoveFiberConnection: (idx: number) => void;
   style?: React.CSSProperties;
+  onUpdateBoxSplitters: (boxId: number, newSplitters: Splitter[]) => void;
+  onUpdateBoxInternalConnections: (boxId: number, newConnections: InternalConnection[]) => void;
 }
 
 // Тип для цветов ODESA
@@ -114,40 +156,115 @@ function CableDetailDialog({
   onClose,
   cables,
   boxes,
-  fiberConnections,
-  selectedFiber,
-  onFiberClick,
+  fiberConnections: globalExternalConnections, // Переименовано для ясности
+  selectedConnectionPoint,
+  onConnectionPointClick,
   onRemoveFiberConnection,
-  style
+  style,
+  onUpdateBoxSplitters,
+  onUpdateBoxInternalConnections,
 }: CableDetailDialogProps) {
+  // НОВОЕ СОСТОЯНИЕ: для показа модального окна отчета по соединениям
+  // ПЕРЕМЕЩЕНО ВВЕРХ, ЧТОБЫ ИЗБЕЖАТЬ ОШИБКИ REACT HOOKS
+  const [showConnectionsReport, setShowConnectionsReport] = useState(false);
+  // НОВОЕ СОСТОЯНИЕ: для сворачивания/разворачивания списка сплиттеров
+  const [showSplitterList, setShowSplitterList] = useState(true); // Можно установить false по умолчанию, если хотите, чтобы он был свернут
+
   const [maxHeight, setMaxHeight] = useState(600);
-  const [rowHeight] = useState(24); // Высота строки для расчетов
-  const [totalWidth] = useState(900); // Увеличиваем общую ширину
-  const [cableSpacing] = useState(40); // Отступ между кабелями
-  const [topPadding] = useState(50); // Отступ сверху для заголовков кабелей
+  const [rowHeight] = useState(24);
+  const minSplitterHeight = 40; // <-- ОПРЕДЕЛЯЕМ ЗДЕСЬ
+  const [totalWidth] = useState(900);
+  const [cableSpacing] = useState(40);
+  const [svgInternalPadding] = useState(50); // Отступ внутри SVG от верхнего края, это будет базовый Y для начала контента
+
+  // Состояние для внутренних соединений и сплиттеров в текущем боксе
+  const [splitters, setSplitters] = useState<Splitter[]>(box?.splitters || []);
+  const [internalConnections, setInternalConnections] = useState<InternalConnection[]>(box?.internalFiberConnections || []);
+
+  useEffect(() => {
+    // Обновляем состояния при изменении пропса box
+    setSplitters(box?.splitters || []);
+    setInternalConnections(box?.internalFiberConnections || []);
+  }, [box]);
   
   const incomingCable = cables.find(c => c.targetBoxId === box?.id);
   const outgoingCables = cables.filter(c => c.sourceBoxId === box?.id);
 
-  // Получаем высоту для входящего кабеля
-  const incomingHeight = incomingCable 
+  // --- Расчеты Y-координат для элементов внутри SVG ---
+  const contentBaseY = svgInternalPadding; // Базовая Y-координата для начала основного контента SVG
+
+  // Позиции для входящего кабеля (левая колонка)
+  const incomingCableHeaderY = contentBaseY;
+  const incomingCableFibersHeight = incomingCable
     ? getCableStructure(incomingCable.fiberCount).length * rowHeight 
     : 0;
+  const incomingCableFibersY = incomingCableHeaderY + 35; // Волокна начинаются на 35px ниже заголовка
 
-  // Получаем общую высоту для всех исходящих кабелей
-  let outgoingHeight = 0;
-  let outgoingRowOffsets: { [key: string]: number } = {};
-  let currentOffset = 0;
+  // Позиции для секции сплиттеров (под входящим кабелем)
+  const splitterSectionY = incomingCableFibersY + incomingCableFibersHeight + (incomingCableFibersHeight > 0 ? 30 : 0); // Отступ 30px после волокон входящего кабеля
+  
+  // Расчет общей высоты для сплиттеров динамически (ПЕРЕМЕЩЕНО СЮДА)
+  const totalSplittersSvgHeight = splitters.reduce((acc, splitter) => {
+    const { input: inputPortsCount, outputs: outputPortsCount } = getSplitterPortCounts(splitter.type);
+    const totalPorts = inputPortsCount + outputPortsCount;
+    const individualSplitterCalculatedHeight = Math.max(minSplitterHeight, totalPorts * rowHeight + 20); 
+    return acc + individualSplitterCalculatedHeight + 20; // +20px отступ между сплиттерами
+  }, 0);
 
-  outgoingCables.forEach(cable => {
-    outgoingRowOffsets[cable.id] = currentOffset;
-    const cableHeight = getCableStructure(cable.fiberCount).length * rowHeight;
-    outgoingHeight += cableHeight + cableSpacing; // Добавляем отступ
-    currentOffset += getCableStructure(cable.fiberCount).length;
+  // Позиции для исходящих кабелей (правая колонка)
+  const outgoingCablesStartRelativeYPositions: number[] = [];
+  let currentOutgoingRelativeY = 0;
+  outgoingCables.forEach((cable) => {
+    outgoingCablesStartRelativeYPositions.push(currentOutgoingRelativeY);
+    const cableFibersHeight = getCableStructure(cable.fiberCount).length * rowHeight;
+    currentOutgoingRelativeY += (cableFibersHeight + 35) + cableSpacing;
   });
+  const totalOutgoingCablesVisualHeight = currentOutgoingRelativeY;
 
-  // Определяем максимальную высоту для рабочей области
-  const svgHeight = Math.max(incomingHeight, outgoingHeight) + 40;
+  // Расчет общей высоты SVG
+  const leftColumnEnd = splitterSectionY + totalSplittersSvgHeight;
+  const rightColumnEnd = contentBaseY + totalOutgoingCablesVisualHeight;
+
+  const svgCalculatedHeight = Math.max(leftColumnEnd, rightColumnEnd) + svgInternalPadding;
+
+  // --- НОВОЕ: Предварительный расчет координат всех портов сплиттеров ---
+  // Этот Map будет хранить абсолютные {x, y} координаты для каждого порта сплиттера
+  const splitterPortCoordinates = new Map<string, { x: number; y: number }>();
+  let currentSplitterAbsoluteY = splitterSectionY; // Абсолютная Y-позиция для текущего сплиттера
+
+  splitters.forEach(splitter => {
+    const portsAlignmentX = 300; // X-координата портов относительно `g` для сплиттеров
+    const absolutePortsX = 20 + portsAlignmentX; // Абсолютная X-координата портов в SVG (20px - смещение группы сплиттеров)
+
+    const { input: inputPortsCount, outputs: outputPortsCount } = getSplitterPortCounts(splitter.type);
+    const totalPorts = inputPortsCount + outputPortsCount;
+    const calculatedSplitterHeight = Math.max(minSplitterHeight, totalPorts * rowHeight + 20);
+    const portSpacing = calculatedSplitterHeight / (totalPorts + 1);
+
+    let currentPortYOffset = portSpacing; // Y-смещение порта относительно начала СВОЕГО сплиттера
+
+    // Сохраняем координаты входных портов
+    for (let idx = 0; idx < inputPortsCount; idx++) {
+      const point: ConnectionPoint = { type: 'splitterPort', splitterId: splitter.id, portType: 'input', portIdx: idx };
+      splitterPortCoordinates.set(JSON.stringify(point), { 
+        x: absolutePortsX, 
+        y: currentSplitterAbsoluteY + currentPortYOffset // Абсолютная Y-координата
+      });
+      currentPortYOffset += portSpacing;
+    }
+
+    // Сохраняем координаты выходных портов
+    for (let idx = 0; idx < outputPortsCount; idx++) {
+      const point: ConnectionPoint = { type: 'splitterPort', splitterId: splitter.id, portType: 'output', portIdx: idx };
+      splitterPortCoordinates.set(JSON.stringify(point), { 
+        x: absolutePortsX, 
+        y: currentSplitterAbsoluteY + currentPortYOffset 
+      });
+      currentPortYOffset += portSpacing;
+    }
+
+    currentSplitterAbsoluteY += calculatedSplitterHeight + 20; // Увеличиваем Y для следующего сплиттера (высота + отступ)
+  });
 
   useEffect(() => {
     const updateHeight = () => {
@@ -161,17 +278,17 @@ function CableDetailDialog({
   if (!box) return null;
 
   const renderCell = (
-    text: string, 
-    background: string, 
-    width: number, 
-    x: number, 
+    text: string,
+    background: string,
+    width: number,
+    x: number,
     y: number,
     border?: string
   ) => (
     <g transform={`translate(${x}, ${y})`}>
-      <rect 
-        width={width} 
-        height={rowHeight} 
+      <rect
+        width={width}
+        height={rowHeight}
         fill={background}
         stroke={border || "none"}
         strokeWidth={border ? 1 : 0}
@@ -194,8 +311,10 @@ function CableDetailDialog({
     const toBox = boxes.find(b => b.id === cable.targetBoxId);
     const length = calculateCableLength(cable.points).toFixed(1);
 
+    // Удален неиспользуемый блок isFiberBusy, который вызывал ошибки типизации
+
     return (
-      <g transform={`translate(${side === 'left' ? 20 : totalWidth - 380}, ${y - 35})`}>
+      <g transform={`translate(${side === 'left' ? 20 : totalWidth - 380}, ${y})`}>
         <rect
           width={280}
           height={24}
@@ -209,8 +328,8 @@ function CableDetailDialog({
           fill="#000"
           style={{ fontSize: '12px' }}
         >
-          Кабель #{cable.id} • {cable.fiberCount}вол. • {length}м • 
-          {side === 'left' ? 
+          Кабель #{cable.id} • {cable.fiberCount}вол. • {length}м •
+          {side === 'left' ?
             `От ${fromBox?.number || '?'}` :
             `До ${toBox?.number || '?'}`}
         </text>
@@ -218,11 +337,278 @@ function CableDetailDialog({
     );
   };
 
-  const isFiberBusy = (cableId: string, fiberIdx: number) => {
-    return fiberConnections.some(conn =>
-      (conn.end1.cableId === cableId && conn.end1.fiberIdx === fiberIdx) ||
-      (conn.end2.cableId === cableId && conn.end2.fiberIdx === fiberIdx)
+  // НОВАЯ / ОБНОВЛЕННАЯ ФУНКЦИЯ ПРОВЕРКИ ЗАНЯТОСТИ ТОЧКИ СОЕДИНЕНИЯ
+  const isConnectionPointBusy = (point: ConnectionPoint) => {
+    // Проверяем ЗАНЯТОСТЬ в рамках внутренних соединений текущего бокса
+    const isBusyInternally = internalConnections.some(conn => {
+      const checkEnd = (end: ConnectionPoint) => {
+        if (point.type === 'cableFiber' && end.type === 'cableFiber') {
+          return end.cableId === point.cableId && end.fiberIdx === point.fiberIdx;
+        }
+        if (point.type === 'splitterPort' && end.type === 'splitterPort') {
+          return end.splitterId === point.splitterId &&
+                 end.portType === point.portType &&
+                 end.portIdx === point.portIdx;
+        }
+        return false;
+      };
+      return checkEnd(conn.end1) || checkEnd(conn.end2);
+    });
+
+    // Дополнительно проверяем, занято ли волокно кабеля внешними соединениями
+    const isBusyExternally = globalExternalConnections.some(conn => {
+      // Проверяем только если текущая 'point' - это волокно кабеля
+      if (point.type === 'cableFiber') {
+        const checkExternalEnd = (end: ConnectionPoint) => {
+          if (end.type === 'cableFiber') {
+            // Проверяем, участвует ли данное соединение в текущем входящем/исходящем кабеле бокса
+            return (end.cableId === point.cableId && end.fiberIdx === point.fiberIdx);
+          }
+          return false;
+        };
+        return checkExternalEnd(conn.end1) || checkExternalEnd(conn.end2);
+      }
+      return false; // Порты сплиттеров не могут быть заняты внешними соединениями
+    });
+
+    return isBusyInternally || isBusyExternally;
+  };
+
+  // НОВАЯ ФУНКЦИЯ для отрисовки сплиттера в SVG
+  const renderSplitterSvg = (splitter: Splitter, y: number) => {
+    const splitterBodyWidth = 80; // Ширина прямоугольного тела сплиттера
+    // X-координата, на которой будут выровнены все порты сплиттера
+    // (относительно начального смещения группы сплиттеров в 20px)
+    const portsAlignmentX = 300; // 320 (абсолютная X для волокон кабеля) - 20 (смещение группы) = 300
+    // X-координата начала прямоугольника сплиттера
+    const splitterRectX = portsAlignmentX - splitterBodyWidth;
+
+    const { input: inputPortsCount, outputs: outputPortsCount } = getSplitterPortCounts(splitter.type);
+    const totalPorts = inputPortsCount + outputPortsCount;
+
+    // Расчет высоты сплиттера, чтобы вместить все порты + отступы
+    const calculatedSplitterHeight = Math.max(minSplitterHeight, totalPorts * rowHeight + 20); 
+
+    // Определяем цвет фона в зависимости от уровня сплиттера (существующая логика)
+    let backgroundColor = '#e0e0e0'; 
+    if (splitter.level === 1) {
+      backgroundColor = '#FFDDDD'; // Светло-красный для 1-го уровня
+    } else if (splitter.level === 2) {
+      backgroundColor = '#DDFFDD'; // Светло-зеленый для 2-го уровня
+    } else if (splitter.level === 3) {
+      backgroundColor = '#DDDDFF'; // Светло-синий для 3-го уровня
+    }
+
+    // Расчет равномерного вертикального интервала между портами
+    const portSpacing = calculatedSplitterHeight / (totalPorts + 1);
+    let currentPortYOffset = portSpacing; // Начальная Y-координата для первого порта
+
+    return (
+      <g transform={`translate(0, ${y})`}> {/* Это 'g' уже смещено на 20px по X в App.tsx */}
+        {/* Фоновый прямоугольник сплиттера */}
+        <rect
+          x={splitterRectX} y="0"
+          width={splitterBodyWidth}
+          height={calculatedSplitterHeight}
+          fill={backgroundColor}
+          stroke="#999"
+          strokeWidth="1"
+          rx="5" ry="5"
+        />
+
+        {/* Вертикальный текст с номером сплиттера */}
+        <text
+          x={splitterRectX + 10} // Смещение от левого края прямоугольника (10px отступ)
+          y={calculatedSplitterHeight / 2} // Центр по высоте
+          textAnchor="start" // Текст будет начинаться от этой точки
+          dominantBaseline="middle" // Центрируем по вертикали относительно Y
+          fontSize="13" 
+          fontWeight="bold"
+          fill="#333"
+          // Поворот вокруг своей точки (x, y), чтобы текст начинался от смещенной X-позиции
+          transform={`rotate(-90 ${splitterRectX + 10} ${calculatedSplitterHeight / 2})`}
+        >
+          {splitter.number || `ID: ${splitter.id.substring(splitter.id.lastIndexOf('-') + 1)}`}
+        </text>
+
+        {/* Входной порт */}
+        {Array.from({ length: inputPortsCount }).map((_, idx) => {
+          const point: ConnectionPoint = {
+            type: 'splitterPort',
+            splitterId: splitter.id,
+            portType: 'input',
+            portIdx: idx,
+          };
+          const isSelected = selectedConnectionPoint?.type === point.type &&
+                             selectedConnectionPoint.splitterId === point.splitterId &&
+                             selectedConnectionPoint.portType === point.portType &&
+                             selectedConnectionPoint.portIdx === point.portIdx;
+          const busy = isConnectionPointBusy(point);
+          const portColor = isSelected ? 'gold' : busy ? 'gray' : '#0070c0';
+          const cursor = busy ? 'not-allowed' : 'pointer';
+
+          // Текущая Y-координата для этого порта
+          const currentPortY = currentPortYOffset;
+          currentPortYOffset += portSpacing; // Увеличиваем смещение для следующего порта
+
+          return (
+            <g key={`in-port-${idx}`} transform={`translate(${portsAlignmentX}, ${currentPortY})`}>
+              <circle
+                cx="0" cy="0" r="6" fill={portColor} stroke="black" strokeWidth="1"
+                style={{ cursor: cursor }}
+                onClick={() => !busy && onConnectionPointClick(point)}
+              >
+                 <title>{`Входной порт ${idx + 1}`}</title>
+              </circle>
+              {/* Метка порта */}
+              <text x="-15" y="0" textAnchor="end" dominantBaseline="middle" fontSize="12" fill="#333">
+                IN
+              </text>
+            </g>
+          );
+        })}
+
+        {/* Выходные порты */}
+        {Array.from({ length: outputPortsCount }).map((_, idx) => {
+          const point: ConnectionPoint = {
+            type: 'splitterPort',
+            splitterId: splitter.id,
+            portType: 'output',
+            portIdx: idx,
+          };
+          const isSelected = selectedConnectionPoint?.type === point.type &&
+                             selectedConnectionPoint.splitterId === point.splitterId &&
+                             selectedConnectionPoint.portType === point.portType &&
+                             selectedConnectionPoint.portIdx === point.portIdx;
+          const busy = isConnectionPointBusy(point);
+          const portColor = isSelected ? 'gold' : busy ? 'gray' : '#0070c0';
+          const cursor = busy ? 'not-allowed' : 'pointer';
+
+          // Текущая Y-координата для этого порта
+          const currentPortY = currentPortYOffset;
+          currentPortYOffset += portSpacing; // Увеличиваем смещение для следующего порта
+
+          return (
+            <g key={`out-port-${idx}`} transform={`translate(${portsAlignmentX}, ${currentPortY})`}>
+              <circle
+                cx="0" cy="0" r="6" fill={portColor} stroke="black" strokeWidth="1"
+                style={{ cursor: cursor }}
+                onClick={() => !busy && onConnectionPointClick(point)}
+              >
+                 <title>{`Выходной порт ${idx + 1}`}</title>
+              </circle>
+              {/* Метка порта */}
+              <text x="-15" y="0" textAnchor="end" dominantBaseline="middle" fontSize="12" fill="#333">
+                OUT{idx + 1}
+              </text>
+            </g>
+          );
+        })}
+      </g>
     );
+  };
+
+  // --- Функции для управления сплиттерами ---
+  const handleAddSplitter = (level: Splitter['level']) => {
+    const newSplitter: Splitter = {
+      id: `splitter-${Date.now()}`,
+      type: '1x8',
+      hasConnector: true,
+      level: level,
+      number: '', // Инициализируем пустым значением для ручного ввода
+    };
+    const updatedSplitters = [...splitters, newSplitter];
+    setSplitters(updatedSplitters);
+    onUpdateBoxSplitters(box.id, updatedSplitters);
+  };
+
+  const handleDeleteSplitter = (splitterId: string) => {
+    const updatedSplitters = splitters.filter(s => s.id !== splitterId);
+    // Также нужно удалить все внутренние соединения, связанные с этим сплиттером
+    const updatedInternalConnections = internalConnections.filter(conn => {
+      const isEnd1SplitterPort = conn.end1.type === 'splitterPort' && conn.end1.splitterId === splitterId;
+      const isEnd2SplitterPort = conn.end2.type === 'splitterPort' && conn.end2.splitterId === splitterId;
+      return !(isEnd1SplitterPort || isEnd2SplitterPort);
+    });
+
+    setSplitters(updatedSplitters);
+    setInternalConnections(updatedInternalConnections); // Обновляем внутренние соединения
+    onUpdateBoxSplitters(box.id, updatedSplitters);
+    onUpdateBoxInternalConnections(box.id, updatedInternalConnections); // Обновляем состояние в App.tsx
+  };
+
+  const handleUpdateSplitterNumber = (splitterId: string, newNumber: string) => {
+    const updatedSplitters = splitters.map(s =>
+      s.id === splitterId ? { ...s, number: newNumber } : s
+    );
+    setSplitters(updatedSplitters);
+    onUpdateBoxSplitters(box.id, updatedSplitters);
+  };
+
+
+  // --- Конец функций для управления сплиттерами ---
+
+  // НОВОЕ СОСТОЯНИЕ: для показа модального окна отчета по соединениям
+  // Эта строка дублируется и должна быть удалена
+  
+  // НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: для форматирования точки соединения в читаемую строку
+  const formatConnectionPoint = (point: ConnectionPoint, currentBoxId: number) => {
+      if (isCableFiber(point)) { // Используем type guard
+          const cable = cables.find(c => String(c.id) === point.cableId);
+          const cableNumber = cable ? `Кабель #${cable.id}` : `Неизвестный кабель #${point.cableId}`;
+          return `${cableNumber} волокно #${point.fiberIdx + 1} (${point.direction === 'in' ? 'вход' : 'выход'})`;
+      } else if (isSplitterPort(point)) { // Используем type guard
+          const splitter = splitters.find(s => s.id === point.splitterId);
+          const splitterName = splitter ? (splitter.number || `Сплиттер ID:${point.splitterId.substring(point.splitterId.lastIndexOf('-') + 1)}`) : `Неизвестный сплиттер ID:${point.splitterId.substring(point.splitterId.lastIndexOf('-') + 1)}`;
+          return `${splitterName} ${point.portType === 'input' ? 'входной' : 'выходной'} порт #${point.portIdx + 1}`;
+      }
+      return 'Неизвестная точка'; // На всякий случай
+  };
+
+  // НОВАЯ ФУНКЦИЯ: для генерации отчета по соединениям
+  const generateConnectionReport = () => {
+      const report: string[] = [];
+
+      // 1. Внутренние соединения для текущего бокса
+      report.push('--- ВНУТРЕННИЕ СОЕДИНЕНИЯ ---');
+      if (internalConnections.length === 0) {
+          report.push('Нет внутренних соединений.');
+      } else {
+          internalConnections.forEach((conn, i) => {
+              const end1Str = formatConnectionPoint(conn.end1, box.id);
+              const end2Str = formatConnectionPoint(conn.end2, box.id);
+              report.push(`${i + 1}. ${end1Str} <---> ${end2Str}`);
+          });
+      }
+
+      // 2. Внешние соединения, имеющие отношение к этому боксу (входящие/исходящие кабели)
+      report.push('\n--- ВНЕШНИЕ СОЕДИНЕНИЯ (с участием кабелей этого бокса) ---');
+      const relevantExternalConnections = globalExternalConnections.filter(conn => {
+          // Проверяем, участвует ли хотя бы один конец соединения во входящем или исходящем кабеле *данного* бокса
+          // И убеждаемся, что оба конца являются волокнами кабеля, так как внешние соединения только между кабелями.
+          if (isCableFiber(conn.end1) && isCableFiber(conn.end2)) {
+              const end1CableId = parseInt(conn.end1.cableId);
+              const end2CableId = parseInt(conn.end2.cableId);
+
+              const isEnd1RelatedToBox = (incomingCable && incomingCable.id === end1CableId) || outgoingCables.some(c => c.id === end1CableId);
+              const isEnd2RelatedToBox = (incomingCable && incomingCable.id === end2CableId) || outgoingCables.some(c => c.id === end2CableId);
+
+              return isEnd1RelatedToBox || isEnd2RelatedToBox;
+          }
+          return false;
+      });
+
+      if (relevantExternalConnections.length === 0) {
+          report.push('Нет внешних соединений, связанных с этим боксом.');
+      } else {
+          relevantExternalConnections.forEach((conn, i) => {
+              const end1Str = formatConnectionPoint(conn.end1, box.id);
+              const end2Str = formatConnectionPoint(conn.end2, box.id);
+              report.push(`${i + 1}. ${end1Str} <---> ${end2Str}`);
+          });
+      }
+
+      return report;
   };
 
   return (
@@ -245,14 +631,14 @@ function CableDetailDialog({
       ...style
     }}>
       {/* Заголовок */}
-      <div style={{ 
-        display: 'flex', 
-        justifyContent: 'space-between', 
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
         alignItems: 'center',
         marginBottom: '20px'
       }}>
         <h2 style={{ margin: 0 }}>Детали бокса №{box.number}</h2>
-        <button onClick={onClose} style={{ 
+        <button onClick={onClose} style={{
           background: 'none',
           border: 'none',
           fontSize: '20px',
@@ -260,11 +646,97 @@ function CableDetailDialog({
         }}>×</button>
       </div>
 
-      {/* Единая рабочая область */}
+      {/* Единая рабочая область (с прокруткой) */}
       <div style={{ overflow: 'auto', flex: 1 }}>
-        <svg 
-          width={totalWidth} 
-          height={svgHeight + topPadding}  // Добавляем отступ сверху
+        {/* HTML секция для управления сплиттерами (вне SVG) */}
+        <div style={{ padding: '10px 20px 10px 20px', borderBottom: '1px dashed #eee', marginBottom: '10px' }}> {/* Уменьшил padding и marginBottom */}
+          <h3 style={{ margin: '5px 0' }}>Управление сплиттерами:</h3> {/* Уменьшил margin */}
+          <div style={{ marginBottom: '10px', display: 'flex', flexWrap: 'wrap', gap: '8px' }}> {/* Уменьшил marginBottom, добавил gap */}
+            <button onClick={() => handleAddSplitter(1)} style={{ padding: '6px 10px', cursor: 'pointer' }}>Добавить Сплиттер 1 ур.</button> {/* Уменьшил padding */}
+            <button onClick={() => handleAddSplitter(2)} style={{ padding: '6px 10px', cursor: 'pointer' }}>Добавить Сплиттер 2 ур.</button>
+            <button onClick={() => handleAddSplitter(3)} style={{ padding: '6px 10px', cursor: 'pointer' }}>Добавить Сплиттер 3 ур.</button>
+            <button 
+              onClick={() => {
+                if (!box) return;
+                const validation = validateBoxConnections(box);
+                if (validation.isValid) {
+                  alert('Проверка пройдена успешно! Все соединения корректны.');
+                } else {
+                  alert('Обнаружены ошибки:\n' + validation.errors.join('\n'));
+                }
+              }} 
+              style={{ 
+                marginLeft: '10px', 
+                padding: '8px 12px', 
+                cursor: 'pointer',
+                backgroundColor: '#4CAF50',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px'
+              }}
+            >
+              Проверить соединения
+            </button>
+            {/* НОВАЯ КНОПКА: Показать соединения */}
+            <button 
+              onClick={() => setShowConnectionsReport(true)}
+              style={{ 
+                marginLeft: '10px', 
+                padding: '8px 12px', 
+                cursor: 'pointer',
+                backgroundColor: '#0070c0', // Синий цвет
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px'
+              }}
+            >
+              Показать соединения
+            </button>
+          </div>
+          {/* ОБНОВЛЕННЫЙ БЛОК: Заголовок для списка сплиттеров и кнопка сворачивания */}
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            marginBottom: '5px' // Немного уменьшил отступ
+          }}>
+            <h4 style={{ margin: '0', cursor: 'pointer' }} onClick={() => setShowSplitterList(!showSplitterList)}>
+              Список сплиттеров ({splitters.length}) {showSplitterList ? '▼' : '►'}
+            </h4>
+          </div>
+          {/* Условное отображение списка сплиттеров */}
+          {showSplitterList && splitters.length > 0 && (
+            <div style={{ border: '1px solid #ccc', padding: '10px', borderRadius: '5px', backgroundColor: '#f9f9f9' }}>
+              {/* <h4 style={{ marginTop: 0, marginBottom: 10 }}>Список сплиттеров:</h4> */} {/* Удален дублирующий заголовок */}
+              {splitters.map((splitter) => (
+                <div key={splitter.id} style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  padding: '5px 0', // Уменьшил padding
+                  borderBottom: '1px dashed #eee',
+                }}>
+                  <span>
+                    Уровень: {splitter.level} | Тип: {splitter.type} | Коннектор: {splitter.hasConnector ? 'Да' : 'Нет'}
+                    <br/>
+                    Номер:
+                    <input
+                      type="text"
+                      value={splitter.number}
+                      onChange={(e) => handleUpdateSplitterNumber(splitter.id, e.target.value)}
+                      style={{ marginLeft: '5px', width: '80px', padding: '2px' }} // Уменьшил padding
+                    />
+                  </span>
+                  <button onClick={() => handleDeleteSplitter(splitter.id)} style={{ marginLeft: '10px', background: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', padding: '4px 8px', cursor: 'pointer' }}>Удалить</button> {/* Уменьшил padding и margin */}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* SVG область для визуализации кабелей и сплиттеров */}
+        <svg
+          width={totalWidth}
+          height={svgCalculatedHeight}
           style={{
             border: '1px solid #ddd',
             borderRadius: '4px',
@@ -277,38 +749,43 @@ function CableDetailDialog({
           {/* Входящий кабель слева */}
           {incomingCable && (
             <>
-              {renderCableInfo(incomingCable, 'left', topPadding)}
-              <g transform={`translate(20, ${topPadding})`}>
+              {renderCableInfo(incomingCable, 'left', incomingCableHeaderY)}
+              <g transform={`translate(20, ${incomingCableFibersY})`}>
                 {getCableStructure(incomingCable.fiberCount).map((fiber, idx) => {
                   const cableId = String(incomingCable.id);
-                  const isSelected = selectedFiber?.cableId === cableId && 
-                                   selectedFiber.fiberIdx === idx && 
-                                   selectedFiber.direction === 'in';
-                  const isConnected = fiberConnections.some(conn =>
-                    conn.end1.cableId === cableId && conn.end1.fiberIdx === idx
-                  );
+                  const point: ConnectionPoint = {
+                    type: 'cableFiber',
+                    cableId: cableId,
+                    fiberIdx: idx,
+                    direction: 'in' // Указываем направление
+                  };
+                  const isSelected = selectedConnectionPoint?.type === point.type &&
+                                   selectedConnectionPoint.cableId === point.cableId &&
+                                   selectedConnectionPoint.fiberIdx === point.fiberIdx &&
+                                   selectedConnectionPoint.direction === point.direction;
+                  const busy = isConnectionPointBusy(point); // Используем isConnectionPointBusy из CableDetailDialog
                   const y = idx * rowHeight;
 
                   return (
                     <g key={`in-${idx}`} transform={`translate(0, ${y})`}>
                       {renderCell(fiber.moduleColor.name, fiber.moduleColor.color, 120, 0, 0, fiber.moduleColor.border)}
                       {renderCell(fiber.fiberColor.name, fiber.fiberColor.color, 120, 120, 0, fiber.fiberColor.border)}
-                      <g 
-                        transform="translate(240, 0)" 
-                        onClick={() => !isFiberBusy(cableId, idx) && onFiberClick(cableId, idx, 'in')}
-                        style={{ cursor: isFiberBusy(cableId, idx) ? 'not-allowed' : 'pointer' }}
+                      <g
+                        transform="translate(240, 0)"
+                        onClick={() => !busy && onConnectionPointClick(point)} // Используем новую функцию и `busy`
+                        style={{ cursor: busy ? 'not-allowed' : 'pointer' }}
                       >
-                        <rect 
-                          width={60} 
-                          height={rowHeight} 
-                          fill={isSelected ? '#ffe066' : isFiberBusy(cableId, idx) ? '#e0e0e0' : isConnected ? '#b2f2ff' : '#fff'}
+                        <rect
+                          width={60}
+                          height={rowHeight}
+                          fill={isSelected ? '#ffe066' : busy ? '#e0e0e0' : '#fff'} // Обновляем цвет, если занято
                         />
                         <text
                           x={30}
                           y={rowHeight / 2}
                           dominantBaseline="middle"
                           textAnchor="middle"
-                          style={{ fontSize: '12px', fill: isFiberBusy(cableId, idx) ? '#888' : '#000' }}
+                          style={{ fontSize: '12px', fill: busy ? '#888' : '#000' }} // Обновляем цвет текста, если занято
                         >
                           {fiber.fiber}
                         </text>
@@ -327,110 +804,327 @@ function CableDetailDialog({
             </>
           )}
 
-          {/* Линии соединений */}
-          {fiberConnections.map((conn, i) => {
+          {/* Секция для визуализации сплиттеров внутри SVG */}
+          {splitters.length > 0 && (
+            <g transform={`translate(20, ${splitterSectionY})`}>
+              {/* <text x="0" y="0" fontSize="14" fill="#333" fontWeight="bold">Визуализация сплиттеров (здесь будут SVG элементы):</text> */}
+              {splitters.map((splitter, sIdx) => {
+                // Динамический расчет Y-позиции для текущего сплиттера
+                let currentSplitterY = 0;
+                if (sIdx > 0) {
+                    for (let i = 0; i < sIdx; i++) {
+                        const prevSplitter = splitters[i];
+                        const prevPorts = getSplitterPortCounts(prevSplitter.type);
+                        const prevTotalPorts = prevPorts.input + prevPorts.outputs;
+                        const prevIndividualHeight = Math.max(40, prevTotalPorts * rowHeight + 20); // 40 - minSplitterHeight
+                        currentSplitterY += prevIndividualHeight + 20; // Высота предыдущего + отступ
+                    }
+                }
+                return (
+                  <React.Fragment key={splitter.id}>
+                    {renderSplitterSvg(splitter, currentSplitterY)}
+                  </React.Fragment>
+                );
+              })}
+            </g>
+          )}
+
+          {/* Линии внешних соединений (кабель-кабель) */}
+          {globalExternalConnections.map((conn, i) => { // Используем globalExternalConnections
             if (!incomingCable) return null;
-            const cable1 = cables.find(c => String(c.id) === conn.end1.cableId);
-            const cable2 = cables.find(c => String(c.id) === conn.end2.cableId);
-            if (!cable1 || !cable2) return null;
 
+            // Убеждаемся, что оба конца соединения являются волокнами кабеля
+            if (conn.end1.type === 'cableFiber' && conn.end2.type === 'cableFiber') {
+              // Явно сужаем тип для conn.end1 и conn.end2
+              const end1 = conn.end1;
+              const end2 = conn.end2;
+
+              const cable1 = cables.find(c => String(c.id) === end1.cableId);
+              const cable2 = cables.find(c => String(c.id) === end2.cableId);
+              if (!cable1 || !cable2) return null;
+
+              let x1, y1, x2, y2;
+              // Определяем координаты для end1
+              if (incomingCable && cable1.id === incomingCable.id) {
+                x1 = 320;
+                y1 = incomingCableFibersY + end1.fiberIdx * rowHeight + rowHeight / 2; // середина волокна
+              } else { // Если end1 - это исходящий кабель (на правой стороне)
+                const cable1Index = outgoingCables.findIndex(c => c.id === cable1.id);
+                if (cable1Index === -1) return null;
+                x1 = totalWidth - 380;
+                y1 = contentBaseY + outgoingCablesStartRelativeYPositions[cable1Index] + 35 + end1.fiberIdx * rowHeight + rowHeight / 2; // середина волокна исходящего
+              }
+
+              // Определяем координаты для end2
+              if (incomingCable && cable2.id === incomingCable.id) {
+                x2 = 320;
+                y2 = incomingCableFibersY + end2.fiberIdx * rowHeight + rowHeight / 2; // середина волокна
+              } else { // Если end2 - это исходящий кабель (на правой стороне)
+                const cable2Index = outgoingCables.findIndex(c => c.id === cable2.id);
+                if (cable2Index === -1) return null;
+                x2 = totalWidth - 380;
+                y2 = contentBaseY + outgoingCablesStartRelativeYPositions[cable2Index] + 35 + end2.fiberIdx * rowHeight + rowHeight / 2; // середина волокна исходящего
+              }
+
+              // НОВОЕ: Логика для изгиба вертикальных линий
+              let controlX1, controlY1, controlX2, controlY2;
+              const minHorizontalDistanceForBend = 10; // Если |x1 - x2| меньше этого значения, применяем изгиб
+              const bendMagnitude = 50; // На сколько пикселей изогнуть линию по горизонтали
+
+              if (Math.abs(x1 - x2) < minHorizontalDistanceForBend) {
+                  // Если точки находятся на одной вертикали (или очень близко), создаем изгиб
+                  // Определяем направление изгиба: если слева, то вправо; если справа, то влево
+                  const bendDirection = (x1 < totalWidth / 2) ? 1 : -1; 
+                  controlX1 = x1 + (bendDirection * bendMagnitude);
+                  controlX2 = x2 + (bendDirection * bendMagnitude);
+                  controlY1 = y1; // Сохраняем горизонтальную касательную в начале
+                  controlY2 = y2; // Сохраняем горизонтальную касательную в конце
+              } else {
+                  // Для горизонтальных или диагональных линий используем существующую логику
+                  controlX1 = x1 + (x2 - x1) * 0.25;
+                  controlX2 = x1 + (x2 - x1) * 0.75;
+                  controlY1 = y1;
+                  controlY2 = y2;
+              }
+
+              return (
+                <path
+                  key={i}
+                  d={`M ${x1} ${y1} C ${controlX1} ${controlY1}, ${controlX2} ${controlY2}, ${x2} ${y2}`}
+                  fill="none"
+                  stroke="#0070c0"
+                  strokeWidth={2}
+                  style={{ cursor: 'pointer', pointerEvents: 'all' }}
+                  onClick={() => onRemoveFiberConnection(i)}
+                >
+                  <title>{`Кабель #${end1.cableId} волокно #${end1.fiberIdx + 1} ↔ Кабель #${end2.cableId} волокно #${end2.fiberIdx + 1}`}</title>
+                </path>
+              );
+            }
+            return null; // Пропускаем соединения, которые не являются "кабель-кабель"
+          })}
+
+          {/* Линии внутренних соединений (сплиттер-сплиттер, волокно-сплиттер) */}
+          {internalConnections.map((conn, i) => { // Теперь используется локальное состояние internalConnections
+            // Определяем координаты для end1
             let x1, y1, x2, y2;
-            if (incomingCable && cable1.id === incomingCable.id) {
-              x1 = 320;
-              y1 = conn.end1.fiberIdx * rowHeight + rowHeight / 2 + topPadding;
+
+            // !!! Важное исправление позиций: теперь используем абсолютные координаты
+            // относительно начала SVG (0,0) для всех точек.
+            // Секция сплиттеров начинается с x=20 и y=splitterSectionY.
+            // Каждый сплиттер внутри этой секции смещен на sIdx * (singleSplitterSvgElementHeight + 20).
+
+            if (conn.end1.type === 'cableFiber') {
+              const cableFiberEnd1 = conn.end1;
+              const cable = cables.find(c => String(c.id) === cableFiberEnd1.cableId);
+              if (!cable) return null;
+
+              // Для входящего кабеля
+              if (cable.targetBoxId === box?.id) {
+                x1 = 20 + 240 + 60; // 20(padding) + 240(модуль+волокно) + 60(ширина_ячейки)
+                y1 = incomingCableFibersY + cableFiberEnd1.fiberIdx * rowHeight + rowHeight / 2;
+              }
+              // Для исходящего кабеля
+              else if (cable.sourceBoxId === box?.id) {
+                const cableIndex = outgoingCables.findIndex(c => c.id === cable.id);
+                if (cableIndex === -1) return null;
+                x1 = totalWidth - 380; // Начало исходящего кабеля
+                y1 = contentBaseY + outgoingCablesStartRelativeYPositions[cableIndex] + 35 + cableFiberEnd1.fiberIdx * rowHeight + rowHeight / 2;
+              } else {
+                return null;
+              }
+            } else if (conn.end1.type === 'splitterPort') {
+              const splitterPortEnd1 = conn.end1;
+              // Используем предрасчитанные координаты из Map
+              const coords = splitterPortCoordinates.get(JSON.stringify(splitterPortEnd1));
+              if (!coords) return null; 
+              x1 = coords.x;
+              y1 = coords.y;
             } else {
-              const idx = outgoingCables.findIndex(c => c.id === cable1.id);
-              const startY = (outgoingRowOffsets[cable1.id] || 0) * rowHeight + idx * cableSpacing + topPadding;
-              x1 = totalWidth - 380;
-              y1 = conn.end1.fiberIdx * rowHeight + rowHeight / 2 + startY;
-            }
-            if (incomingCable && cable2.id === incomingCable.id) {
-              x2 = 320;
-              y2 = conn.end2.fiberIdx * rowHeight + rowHeight / 2 + topPadding;
-            } else {
-              const idx = outgoingCables.findIndex(c => c.id === cable2.id);
-              const startY = (outgoingRowOffsets[cable2.id] || 0) * rowHeight + idx * cableSpacing + topPadding;
-              x2 = totalWidth - 380;
-              y2 = conn.end2.fiberIdx * rowHeight + rowHeight / 2 + startY;
+              return null;
             }
 
-            const controlX1 = x1 + (x2 - x1) * 0.25;
-            const controlX2 = x1 + (x2 - x1) * 0.75;
+            // Определяем координаты для end2
+            if (conn.end2.type === 'cableFiber') {
+              const cableFiberEnd2 = conn.end2;
+              const cable = cables.find(c => String(c.id) === cableFiberEnd2.cableId);
+              if (!cable) return null;
 
+              // Для входящего кабеля
+              if (cable.targetBoxId === box?.id) {
+                x2 = 20 + 240 + 60; // 20(padding) + 240(модуль+волокно) + 60(ширина_ячейки)
+                y2 = incomingCableFibersY + cableFiberEnd2.fiberIdx * rowHeight + rowHeight / 2;
+              }
+              // Для исходящего кабеля
+              else if (cable.sourceBoxId === box?.id) {
+                const cableIndex = outgoingCables.findIndex(c => c.id === cable.id);
+                if (cableIndex === -1) return null;
+                x2 = totalWidth - 380; // Начало исходящего кабеля
+                y2 = contentBaseY + outgoingCablesStartRelativeYPositions[cableIndex] + 35 + cableFiberEnd2.fiberIdx * rowHeight + rowHeight / 2;
+              } else {
+                return null;
+              }
+            } else if (conn.end2.type === 'splitterPort') {
+              const splitterPortEnd2 = conn.end2;
+              // Используем предрасчитанные координаты из Map
+              const coords = splitterPortCoordinates.get(JSON.stringify(splitterPortEnd2));
+              if (!coords) return null;
+              x2 = coords.x;
+              y2 = coords.y;
+            } else {
+              return null;
+            }
+
+            // НОВОЕ: Логика для изгиба вертикальных линий (повторяем ту же логику)
+            let controlX1, controlY1, controlX2, controlY2;
+            const minHorizontalDistanceForBend = 10; // Если |x1 - x2| меньше этого значения, применяем изгиб
+            const bendMagnitude = 50; // На сколько пикселей изогнуть линию по горизонтали
+
+            if (Math.abs(x1 - x2) < minHorizontalDistanceForBend) {
+                // Если точки находятся на одной вертикали (или очень близко), создаем изгиб
+                const bendDirection = (x1 < totalWidth / 2) ? 1 : -1; // Изгиб вправо, если слева; влево, если справа
+                controlX1 = x1 + (bendDirection * bendMagnitude);
+                controlX2 = x2 + (bendDirection * bendMagnitude);
+                controlY1 = y1; // Сохраняем горизонтальную касательную
+                controlY2 = y2; // Сохраняем горизонтальную касательную
+            } else {
+                // Для горизонтальных или диагональных линий используем существующую логику
+                controlX1 = x1 + (x2 - x1) * 0.25;
+                controlX2 = x1 + (x2 - x1) * 0.75;
+                controlY1 = y1;
+                controlY2 = y2;
+            }
+
+            // Цвет для внутренних соединений (например, оранжевый)
             return (
               <path
-                key={i}
-                d={`M ${x1} ${y1} C ${controlX1} ${y1}, ${controlX2} ${y2}, ${x2} ${y2}`}
+                key={`internal-conn-${i}`}
+                d={`M ${x1} ${y1} C ${controlX1} ${controlY1}, ${controlX2} ${controlY2}, ${x2} ${y2}`}
                 fill="none"
-                stroke="#0070c0"
+                stroke="#ff9900" // Оранжевый цвет для внутренних соединений
                 strokeWidth={2}
                 style={{ cursor: 'pointer', pointerEvents: 'all' }}
-                onClick={() => onRemoveFiberConnection(i)}
+                onClick={() => {
+                  // Логика удаления внутреннего соединения
+                  const updatedInternalConnections = internalConnections.filter((_, idx) => idx !== i);
+                  setInternalConnections(updatedInternalConnections);
+                  onUpdateBoxInternalConnections(box.id, updatedInternalConnections);
+                }}
               >
-                <title>{`Кабель #${conn.end1.cableId} волокно #${conn.end1.fiberIdx + 1} ↔ Кабель #${conn.end2.cableId} волокно #${conn.end2.fiberIdx + 1}`}</title>
+                <title>{`Внутреннее соединение`}</title>
               </path>
             );
           })}
 
-          {/* Исходящие кабели справа */}
-          {outgoingCables.map((cable, cableIndex) => {
-            const startY = (outgoingRowOffsets[cable.id] || 0) * rowHeight + 
-                          cableIndex * cableSpacing + 
-                          topPadding;
-            return (
-              <g key={`out-${cable.id}`}>
-                {renderCableInfo(cable, 'right', startY)}
-                <g transform={`translate(${totalWidth - 380}, ${startY})`}>
-                  {getCableStructure(cable.fiberCount).map((fiber, idx) => {
-                    const cableId = String(cable.id);
-                    const isSelected = selectedFiber?.cableId === cableId && 
-                                     selectedFiber.fiberIdx === idx && 
-                                     selectedFiber.direction === 'out';
-                    const isConnected = fiberConnections.some(conn =>
-                      conn.end2.cableId === cableId && conn.end2.fiberIdx === idx
-                    );
-                    const y = idx * rowHeight;
 
-                    return (
-                      <g key={`out-${idx}`} transform={`translate(0, ${y})`}>
-                        <g 
-                          transform="translate(0, 0)" 
-                          onClick={() => !isFiberBusy(cableId, idx) && onFiberClick(cableId, idx, 'out')}
-                          style={{ cursor: isFiberBusy(cableId, idx) ? 'not-allowed' : 'pointer' }}
-                        >
-                          <rect 
-                            width={60} 
-                            height={rowHeight} 
-                            fill={isSelected ? '#ffe066' : isFiberBusy(cableId, idx) ? '#e0e0e0' : isConnected ? '#b2f2ff' : '#fff'}
-                          />
-                          <text
-                            x={30}
-                            y={rowHeight / 2}
-                            dominantBaseline="middle"
-                            textAnchor="middle"
-                            style={{ fontSize: '12px', fill: isFiberBusy(cableId, idx) ? '#888' : '#000' }}
-                          >
-                            {fiber.fiber}
-                          </text>
-                          <circle
-                            cx={0}
-                            cy={rowHeight / 2}
-                            r={4}
-                            fill="#0070c0"
-                            style={{ filter: 'drop-shadow(0 0 1px rgba(0,0,0,0.3))' }}
-                          />
-                        </g>
-                        {renderCell(fiber.fiberColor.name, fiber.fiberColor.color, 120, 60, 0, fiber.fiberColor.border)}
-                        {renderCell(fiber.moduleColor.name, fiber.moduleColor.color, 120, 180, 0, fiber.moduleColor.border)}
-                      </g>
-                    );
-                  })}
-                </g>
-              </g>
-            );
-          })}
+          {/* Исходящие кабели справа */}
+          {outgoingCables.length > 0 && (
+            <g transform={`translate(0, ${contentBaseY})`}>
+              {outgoingCables.map((cable, cableIndex) => {
+                const cableGroupOverallY = outgoingCablesStartRelativeYPositions[cableIndex];
+                return (
+                  <g key={`out-${cable.id}`} transform={`translate(0, ${cableGroupOverallY})`}>
+                    {renderCableInfo(cable, 'right', 0)}
+                    <g transform={`translate(${totalWidth - 380}, 35)`}>
+                      {getCableStructure(cable.fiberCount).map((fiber, idx) => {
+                        const cableId = String(cable.id);
+                        const point: ConnectionPoint = {
+                          type: 'cableFiber',
+                          cableId: cableId,
+                          fiberIdx: idx,
+                          direction: 'out' // Указываем направление
+                        };
+                        const isSelected = selectedConnectionPoint?.type === point.type &&
+                                         selectedConnectionPoint.cableId === point.cableId &&
+                                         selectedConnectionPoint.fiberIdx === point.fiberIdx &&
+                                         selectedConnectionPoint.direction === point.direction;
+                        const busy = isConnectionPointBusy(point); // Используем isConnectionPointBusy из CableDetailDialog
+                        const y = idx * rowHeight;
+
+                        return (
+                          <g key={`out-${idx}`} transform={`translate(0, ${y})`}>
+                            <g
+                              transform="translate(0, 0)"
+                              onClick={() => !busy && onConnectionPointClick(point)} // Используем новую функцию и `busy`
+                              style={{ cursor: busy ? 'not-allowed' : 'pointer' }}
+                            >
+                              <rect
+                                width={60}
+                                height={rowHeight}
+                                fill={isSelected ? '#ffe066' : busy ? '#e0e0e0' : '#fff'} // Обновляем цвет, если занято
+                              />
+                              <text
+                                x={30}
+                                y={rowHeight / 2}
+                                dominantBaseline="middle"
+                                textAnchor="middle"
+                                style={{ fontSize: '12px', fill: busy ? '#888' : '#000' }} // Обновляем цвет текста, если занято
+                              >
+                                {fiber.fiber}
+                              </text>
+                              <circle
+                                cx={0}
+                                cy={rowHeight / 2}
+                                r={4}
+                                fill="#0070c0"
+                                style={{ filter: 'drop-shadow(0 0 1px rgba(0,0,0,0.3))' }}
+                              />
+                            </g>
+                            {renderCell(fiber.fiberColor.name, fiber.fiberColor.color, 120, 60, 0, fiber.fiberColor.border)}
+                            {renderCell(fiber.moduleColor.name, fiber.moduleColor.color, 120, 180, 0, fiber.moduleColor.border)}
+                          </g>
+                        );
+                      })}
+                    </g>
+                  </g>
+                );
+              })}
+            </g>
+          )}
         </svg>
       </div>
+      
+      {/* НОВОЕ МОДАЛЬНОЕ ОКНО: Отчет по соединениям */}
+      {showConnectionsReport && (
+          <div style={{
+              position: 'fixed',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              backgroundColor: 'white',
+              padding: '20px',
+              borderRadius: '8px',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
+              maxHeight: `${maxHeight * 0.8}px`, // Немного меньше, чем основное окно
+              maxWidth: '600px',
+              width: '80%',
+              overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
+              zIndex: 6001, // Выше, чем основное окно
+              border: '1px solid #ccc'
+          }}>
+              <div style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: '15px'
+              }}>
+                  <h3 style={{ margin: 0 }}>Отчет по соединениям бокса №{box.number}</h3>
+                  <button onClick={() => setShowConnectionsReport(false)} style={{
+                      background: 'none',
+                      border: 'none',
+                      fontSize: '20px',
+                      cursor: 'pointer'
+                  }}>×</button>
+              </div>
+              <div style={{ flex: 1, overflowY: 'auto', border: '1px solid #eee', padding: '10px', borderRadius: '4px' }}>
+                  {generateConnectionReport().map((line, index) => (
+                      <p key={index} style={{ margin: '5px 0', fontSize: '14px', whiteSpace: 'pre-wrap' }}>{line}</p>
+                  ))}
+              </div>
+          </div>
+      )}
     </div>
   );
 }
@@ -490,15 +1184,20 @@ function AddWellOnMap({ onMapClick, enabled }: { onMapClick: (pos: [number, numb
   return null;
 }
 
-function getBoxIcon(number: string) {
+function getBoxIcon(number: string, status: Box['status']) { // Добавляем status как параметр
+  let fillColor = 'blue'; // По умолчанию проектируемый - синий
+  if (status === 'existing') {
+    fillColor = 'red'; // Существующий - красный
+  }
+
   return new DivIcon({
     className: '',
-    iconSize: [40, 40],
-    iconAnchor: [20, 20],
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
     html: `
-      <svg width="40" height="40" xmlns="http://www.w3.org/2000/svg">
-        <rect x="5" y="5" width="30" height="30" rx="4" fill="blue" fill-opacity="0.7" stroke="black" stroke-width="2" />
-        <text x="20" y="25" font-size="14" text-anchor="middle" fill="white">${number}</text>
+      <svg width="30" height="30" xmlns="http://www.w3.org/2000/svg">
+        <rect x="5" y="5" width="20" height="20" rx="4" fill="${fillColor}" fill-opacity="0.7" stroke="black" stroke-width="2" />
+        <text x="15" y="18" font-size="14" text-anchor="middle" fill="white">${number}</text>
       </svg>
     `
   });
@@ -614,28 +1313,186 @@ function getWellIcon() {
   });
 }
 
+// Добавляем функцию isConnectionPointBusyGlobal
+function isConnectionPointBusyGlobal(
+  point: ConnectionPoint,
+  // Параметр openedBoxId удален, так как функция теперь проверяет все боксы.
+  boxes: Box[],
+  fiberConnections: InternalConnection[] // Эти соединения являются глобальными внешними
+): boolean {
+  // Проверяем занятость во внешних (глобальных) соединениях
+  const isBusyExternally = fiberConnections.some(conn => {
+    const checkEnd = (end: ConnectionPoint) => {
+      // Если точка - волокно кабеля, проверяем, занята ли она во внешних соединениях
+      if (point.type === 'cableFiber' && end.type === 'cableFiber') {
+        return end.cableId === point.cableId && end.fiberIdx === point.fiberIdx;
+      }
+      // Порты сплиттеров не могут быть во внешних соединениях, поэтому здесь всегда false
+      return false;
+    };
+    return checkEnd(conn.end1) || checkEnd(conn.end2);
+  });
+
+  if (isBusyExternally) return true; // Если точка занята внешне, сразу возвращаем true
+
+  // Затем проверяем занятость во внутренних соединениях каждого бокса
+  for (const box of boxes) {
+    const isBusyInternallyInThisBox = box.internalFiberConnections.some(conn => {
+      const checkEnd = (end: ConnectionPoint) => {
+        // Если точка - волокно кабеля
+        if (point.type === 'cableFiber' && end.type === 'cableFiber') {
+          // Проверяем, является ли это волокно частью входящего/исходящего кабеля данного бокса
+          const isIncomingCableOfBox = box.connections.input?.cableId === parseInt(point.cableId);
+          const isOutgoingCableOfBox = box.connections.outputs.some(out => out?.cableId === parseInt(point.cableId));
+          
+          if ((isIncomingCableOfBox || isOutgoingCableOfBox) && end.cableId === point.cableId && end.fiberIdx === point.fiberIdx) {
+            return true;
+          }
+        }
+        // Если точка - порт сплиттера
+        if (point.type === 'splitterPort' && end.type === 'splitterPort') {
+          // Проверяем, принадлежит ли этот порт сплиттеру внутри данного бокса
+          const isSplitterInThisBox = box.splitters.some(s => s.id === point.splitterId);
+          if (isSplitterInThisBox && end.splitterId === point.splitterId && 
+              end.portType === point.portType && 
+              end.portIdx === point.portIdx) {
+            return true;
+          }
+        }
+        return false;
+      };
+      return checkEnd(conn.end1) || checkEnd(conn.end2);
+    });
+    if (isBusyInternallyInThisBox) return true; // Если точка занята внутри этого бокса, возвращаем true
+  }
+
+  return false; // Если точка не занята нигде
+}
+
+// Добавляем type guards для ConnectionPoint (если они были удалены, восстановим их)
+function isSplitterPort(point: ConnectionPoint): point is { type: 'splitterPort'; splitterId: string; portType: 'input' | 'output'; portIdx: number } {
+  return point.type === 'splitterPort';
+}
+
+function isCableFiber(point: ConnectionPoint): point is { type: 'cableFiber'; cableId: string; fiberIdx: number; direction: 'in' | 'out' } {
+  return point.type === 'cableFiber';
+}
+
+// Обновляем функцию validateBoxConnections (с явным сужением типа)
+function validateBoxConnections(box: Box): { isValid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  
+  // Проверяем каждое внутреннее соединение
+  box.internalFiberConnections.forEach((conn, idx) => {
+    // Проверка 1: Оба конца соединения должны быть определены
+    if (!conn.end1 || !conn.end2) {
+      errors.push(`Соединение #${idx + 1}: Один из концов соединения не определен`);
+      return;
+    }
+
+    // Проверка 2: Нельзя соединять два входных порта сплиттера
+    if (isSplitterPort(conn.end1) && isSplitterPort(conn.end2)) {
+      if (conn.end1.portType === 'input' && conn.end2.portType === 'input') {
+        errors.push(`Соединение #${idx + 1}: Нельзя соединять два входных порта сплиттеров`);
+      }
+    }
+
+    // Проверка 3: Проверяем соответствие типов сплиттеров и количества соединений
+    if (isSplitterPort(conn.end1)) {
+      const end1SplitterPort = conn.end1; // Явное сужение типа
+      const splitter1 = box.splitters.find(s => s.id === end1SplitterPort.splitterId);
+      if (splitter1) {
+        const portCounts = getSplitterPortCounts(splitter1.type);
+        if (end1SplitterPort.portType === 'input' && end1SplitterPort.portIdx >= portCounts.input) {
+          errors.push(`Соединение #${idx + 1}: Входной порт ${end1SplitterPort.portIdx + 1} не существует для сплиттера типа ${splitter1.type}`);
+        }
+        if (end1SplitterPort.portType === 'output' && end1SplitterPort.portIdx >= portCounts.outputs) {
+          errors.push(`Соединение #${idx + 1}: Выходной порт ${end1SplitterPort.portIdx + 1} не существует для сплиттера типа ${splitter1.type}`);
+        }
+      }
+    }
+    if (isSplitterPort(conn.end2)) {
+      const end2SplitterPort = conn.end2; // Явное сужение типа
+      const splitter2 = box.splitters.find(s => s.id === end2SplitterPort.splitterId);
+      if (splitter2) {
+        const portCounts = getSplitterPortCounts(splitter2.type);
+        if (end2SplitterPort.portType === 'input' && end2SplitterPort.portIdx >= portCounts.input) {
+          errors.push(`Соединение #${idx + 1}: Входной порт ${end2SplitterPort.portIdx + 1} не существует для сплиттера типа ${splitter2.type}`);
+        }
+        if (end2SplitterPort.portType === 'output' && end2SplitterPort.portIdx >= portCounts.outputs) {
+          errors.push(`Соединение #${idx + 1}: Выходной порт ${end2SplitterPort.portIdx + 1} не существует для сплиттера типа ${splitter2.type}`);
+        }
+      }
+    }
+  });
+
+  // Проверка 4: Проверяем "висящие" соединения
+  const allConnectionPoints = new Set<string>();
+  box.internalFiberConnections.forEach(conn => {
+    if (isSplitterPort(conn.end1)) { // Используем type guard
+        allConnectionPoints.add(JSON.stringify(conn.end1));
+    }
+    if (isSplitterPort(conn.end2)) { // Используем type guard
+        allConnectionPoints.add(JSON.stringify(conn.end2));
+    }
+  });
+
+  // Проверяем все порты сплиттеров
+  box.splitters.forEach(splitter => {
+    const portCounts = getSplitterPortCounts(splitter.type);
+    
+    // Проверяем входные порты
+    for (let i = 0; i < portCounts.input; i++) {
+      const port: ConnectionPoint = {
+        type: 'splitterPort',
+        splitterId: splitter.id,
+        portType: 'input',
+        portIdx: i
+      };
+      if (!allConnectionPoints.has(JSON.stringify(port))) {
+        errors.push(`Сплиттер ${splitter.number || splitter.id.substring(splitter.id.lastIndexOf('-') + 1)}: Входной порт ${i + 1} не соединен`);
+      }
+    }
+    
+    // Проверяем выходные порты
+    for (let i = 0; i < portCounts.outputs; i++) {
+      const port: ConnectionPoint = {
+        type: 'splitterPort',
+        splitterId: splitter.id,
+        portType: 'output',
+        portIdx: i
+      };
+      if (!allConnectionPoints.has(JSON.stringify(port))) {
+        errors.push(`Сплиттер ${splitter.number || splitter.id.substring(splitter.id.lastIndexOf('-') + 1)}: Выходной порт ${i + 1} не соединен`);
+      }
+    }
+  });
+
+  return {
+    isValid: errors.length === 0,
+    errors
+  };
+}
+
 function App() {
   const [boxes, setBoxes] = useState<Box[]>([]);
   const [selectedBox, setSelectedBox] = useState<Box | null>(null);
   const [addBoxMode, setAddBoxMode] = useState(false);
   const [addCableMode, setAddCableMode] = useState(false);
   const [newBoxPosition, setNewBoxPosition] = useState<[number, number] | null>(null);
-  const [boxParams, setBoxParams] = useState({ number: "", splitter: "", address: "", place: "" });
+  const [boxParams, setBoxParams] = useState({ 
+    number: "", 
+    address: "", 
+    place: "" 
+  });
 
   const [cables, setCables] = useState<Cable[]>([]);
   const [cablePoints, setCablePoints] = useState<[number, number][]>([]);
   const [selectedCableId, setSelectedCableId] = useState<number | null>(null);
 
-  const [fiberConnections, setFiberConnections] = useState<{
-    end1: { cableId: string; fiberIdx: number };
-    end2: { cableId: string; fiberIdx: number };
-  }[]>([]);
+  const [fiberConnections, setFiberConnections] = useState<InternalConnection[]>([]);
 
-  const [selectedFiber, setSelectedFiber] = useState<{
-    cableId: string;
-    fiberIdx: number;
-    direction: 'in' | 'out';
-  } | null>(null);
+  const [selectedConnectionPoint, setSelectedConnectionPoint] = useState<ConnectionPoint | null>(null);
 
   const leftTableRef = useRef<HTMLDivElement>(null);
   const rightTableRef = useRef<HTMLDivElement>(null);
@@ -668,6 +1525,7 @@ function App() {
   const [cablesOpen, setCablesOpen] = useState(true);
   const [polesOpen, setPolesOpen] = useState(true);
   const [wellsOpen, setWellsOpen] = useState(true);
+  const [splittersOpen, setSplittersOpen] = useState(false); // Изменено с true на false
 
   const [isFileMenuOpen, setIsFileMenuOpen] = useState(false);
   const [isPassportsMenuOpen, setIsPassportsMenuOpen] = useState(false);
@@ -769,27 +1627,34 @@ function App() {
   }, []);
 
   const handleMapClick = (position: [number, number]) => {
-    setNewBoxPosition(position);
-    setAddBoxMode(false);
+    if (addBoxMode) {
+      setNewBoxPosition(position);
+      // Убираем setAddBoxMode(false) отсюда
+    }
   };
 
   const handleAddBox = (position: [number, number]) => {
-    const newBox = {
+    const newBox: Box = {
       id: boxes.length + 1,
       position,
       number: boxParams.number,
-      splitter: boxParams.splitter,
       address: boxParams.address,
       place: boxParams.place,
       connections: {
         input: null,
-        outputs: Array(6).fill(null) // Создаем 6 пустых слотов для исходящих кабелей
-      }
+        outputs: Array(6).fill(null)
+      },
+      splitters: [],
+      internalFiberConnections: [],
+      status: 'projected',
+      oltTerminalNo: '',
+      oltPortNo: '',
+      model: 'FOB-05-24', // Инициализация по умолчанию, можно выбрать другое
     };
     setBoxes([...boxes, newBox]);
     setNewBoxPosition(null);
     setAddBoxMode(false);
-    setBoxParams({ number: "", splitter: "", address: "", place: "" });
+    setBoxParams({ number: "", address: "", place: "" });
   };
 
   const handleSaveBox = () => {
@@ -799,10 +1664,12 @@ function App() {
 
   const handleMarkerDblClick = (boxId: number) => {
     setOpenedBoxId(boxId);
+    boxIdToUpdateInternalConnections.current = boxId; // Сохраняем ID бокса для обновления внутренних соединений
   };
 
   const handleCloseDetails = () => {
     setOpenedBoxId(null);
+    boxIdToUpdateInternalConnections.current = null; // Очищаем ID при закрытии
   };
 
   const handleMarkerDragEnd = (boxId: number, e: DragEndEvent) => {
@@ -925,27 +1792,71 @@ function App() {
   console.log('cablePoints', cablePoints);
   console.log('fiberConnections:', fiberConnections);
 
-  function handleFiberClick(cableId: string, fiberIdx: number, direction: 'in' | 'out') {
-    if (isFiberBusyGlobal(cableId, fiberIdx)) return;
-    if (!selectedFiber) {
-      setSelectedFiber({ cableId, fiberIdx, direction });
+  // Обновляем вызов функции в handleConnectionPointClick
+  function handleConnectionPointClick(point: ConnectionPoint) {
+    // Используем обновленную глобальную функцию для проверки занятости
+    // Обратите внимание: `openedBoxId` здесь не передается, т.к. `isConnectionPointBusyGlobal` теперь сама итерируется по всем боксам
+    if (isConnectionPointBusyGlobal(point, boxes, fiberConnections)) return;
+
+    if (!selectedConnectionPoint) {
+      setSelectedConnectionPoint(point);
     } else {
-      // Нельзя соединять волокно само с собой
-      if (selectedFiber.cableId === cableId && selectedFiber.fiberIdx === fiberIdx) {
-        setSelectedFiber(null);
+      // Проверка на совпадение типов точек и конкретных ID (для отмены выбора)
+      if (selectedConnectionPoint.type === point.type) {
+        if (point.type === 'cableFiber' && selectedConnectionPoint.type === 'cableFiber') {
+          if (selectedConnectionPoint.cableId === point.cableId && 
+              selectedConnectionPoint.fiberIdx === point.fiberIdx) {
+            setSelectedConnectionPoint(null);
+            return;
+          }
+        }
+        if (point.type === 'splitterPort' && selectedConnectionPoint.type === 'splitterPort') {
+          if (selectedConnectionPoint.splitterId === point.splitterId && 
+              selectedConnectionPoint.portType === point.portType && 
+              selectedConnectionPoint.portIdx === point.portIdx) {
+            setSelectedConnectionPoint(null);
+            return;
+          }
+        }
+      }
+      
+      // Обе точки должны быть свободны (повторная проверка на случай, если первая точка стала занятой между кликами)
+      // Используем обновленную глобальную функцию
+      if (isConnectionPointBusyGlobal(selectedConnectionPoint, boxes, fiberConnections)) {
+        setSelectedConnectionPoint(null);
         return;
       }
-      // Оба волокна должны быть свободны
-      if (isFiberBusyGlobal(selectedFiber.cableId, selectedFiber.fiberIdx)) {
-        setSelectedFiber(null);
-        return;
+
+      // Определяем, является ли соединение внутренним (хотя бы один конец - порт сплиттера)
+      const isInternalConnection = 
+        selectedConnectionPoint.type === 'splitterPort' || point.type === 'splitterPort';
+
+      if (isInternalConnection) {
+        // Это внутреннее соединение, связанное со сплиттером
+        if (openedBoxId !== null) { // Убеждаемся, что диалог бокса открыт
+          setBoxes(prevBoxes => prevBoxes.map(box => {
+            if (box.id === openedBoxId) {
+              return {
+                ...box,
+                internalFiberConnections: [...box.internalFiberConnections, { end1: selectedConnectionPoint, end2: point }]
+              };
+            }
+            return box;
+          }));
+        } else {
+            // Если мы пытаемся создать внутреннее соединение, но диалог бокса не открыт - это логическая ошибка
+            console.warn("Попытка создать внутреннее соединение вне контекста открытого бокса.");
+            alert("Не удалось создать соединение: бокс не выбран.");
+        }
+      } else {
+        // Это внешнее соединение (кабель-кабель)
+        setFiberConnections(prev => [...prev, {
+          end1: selectedConnectionPoint,
+          end2: point
+        }]);
       }
-      // Добавляем соединение
-      setFiberConnections([...fiberConnections, {
-        end1: { cableId: selectedFiber.cableId, fiberIdx: selectedFiber.fiberIdx },
-        end2: { cableId, fiberIdx }
-      }]);
-      setSelectedFiber(null);
+      
+      setSelectedConnectionPoint(null);
     }
   }
 
@@ -1026,7 +1937,6 @@ function App() {
         <name>Бокс №${box.number}</name>
         <description>
           <![CDATA[
-            <b>Сплиттер:</b> ${box.splitter}<br/>
             <b>Адрес:</b> ${box.address}<br/>
             <b>Место:</b> ${box.place}
           ]]>
@@ -1066,10 +1976,15 @@ function App() {
 
   // Глобальная проверка занятости волокна (для handleFiberClick)
   function isFiberBusyGlobal(cableId: string, fiberIdx: number) {
-    return fiberConnections.some(conn =>
-      (conn.end1.cableId === cableId && conn.end1.fiberIdx === fiberIdx) ||
-      (conn.end2.cableId === cableId && conn.end2.fiberIdx === fiberIdx)
-    );
+    return fiberConnections.some(conn => {
+      const checkEnd = (end: ConnectionPoint) => {
+        if (end.type === 'cableFiber') {
+          return end.cableId === cableId && end.fiberIdx === fiberIdx;
+        }
+        return false;
+      };
+      return checkEnd(conn.end1) || checkEnd(conn.end2);
+    });
   }
 
   function getPoleIcon(purpose: string) {
@@ -1182,6 +2097,7 @@ function App() {
   const handleToggleCables = () => setCablesOpen(!cablesOpen);
   const handleTogglePoles = () => setPolesOpen(!polesOpen);
   const handleToggleWells = () => setWellsOpen(!wellsOpen);
+  const handleToggleSplitters = () => setSplittersOpen(!splittersOpen); // НОВАЯ ФУНКЦИЯ: для открытия/закрытия списка сплиттеров
 
   // === Функции переключения меню ===
   const toggleFileMenu = () => {
@@ -1255,7 +2171,6 @@ function App() {
       return {
         ID: box.id,
         Номер: box.number,
-        Сплиттер: box.splitter,
         Адрес: box.address,
         Место: box.place,
         Координаты: `${box.position[0].toFixed(6)}, ${box.position[1].toFixed(6)}`,
@@ -1357,7 +2272,6 @@ function App() {
               id: row.ID || Math.max(...boxes.map(b => b.id), 0) + 1,
               position: [lat, lng] as [number, number],
               number: row.Номер || '',
-              splitter: row.Сплиттер || '',
               address: row.Адрес || '',
               place: row.Место || '',
               connections: {
@@ -1365,8 +2279,18 @@ function App() {
                 outputs: row.Исходящие_кабели_ID ? 
                   row.Исходящие_кабели_ID.split(',').map((id: string) => ({ cableId: parseInt(id.trim()) })) : 
                   Array(6).fill(null)
-              }
-            };
+              },
+              splitters: [],
+              internalFiberConnections: [],
+              // Явно проверяем тип status при импорте
+              status: (row.Состояние === 'existing' || row.Состояние === 'projected') ? row.Состояние : 'projected',
+              oltTerminalNo: row['№ терминала (OLT)'] || '',
+              oltPortNo: row['№ порта (OLT Port)'] || '',
+              // НОВОЕ ПОЛЕ: Модель бокса (берем из импорта или ставим по умолчанию)
+              model: (['FOB-02-04-04LC', 'FOB-03-12-08LC', 'FOB-04-16-16LC', 'FOB-05-24-24LC',
+                       'FOB-02-04-04SC', 'FOB-03-12-08SC', 'FOB-04-16-16SC', 'FOB-05-24-24SC',
+                       'FOB-05-24'].includes(row['Модель бокса'])) ? row['Модель бокса'] : 'FOB-05-24',
+            } as Box; // Явно приводим каждый элемент к типу Box
           });
 
           setBoxes(newBoxes);
@@ -1454,6 +2378,8 @@ function App() {
     input.click();
   };
 
+  const boxIdToUpdateInternalConnections = useRef<number | null>(null);
+
   return (
     <div style={{
       display: 'flex',
@@ -1472,7 +2398,7 @@ function App() {
         boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
         flexShrink: 0
       }}>
-        Тестовая страница проекта GPON
+        NOVA                 Тестовая страница проекта GPON
       </div>
 
       {/* Строка меню */}
@@ -1777,6 +2703,97 @@ function App() {
                   )}
                 </div>
 
+                {/* НОВАЯ СЕКЦИЯ: Сплиттеры */}
+                <div style={{ marginBottom: 15 }}>
+                  <b onClick={handleToggleSplitters} style={{ cursor: 'pointer', display: 'block', padding: '5px 0' }}>
+                    Сплиттеры ({boxes.reduce((acc, box) => acc + box.splitters.length, 0)})
+                  </b>
+                  {splittersOpen && (
+                    <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
+                      {/* Сплиттеры 1-го уровня */}
+                      <li style={{ marginTop: 5 }}>
+                        <b style={{ cursor: 'pointer', display: 'block' }}>
+                          Сплиттеры 1-го уровня ({boxes.reduce((acc, box) => acc + box.splitters.filter(s => s.level === 1).length, 0)})
+                        </b>
+                        <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
+                          {boxes.map(box => (
+                            <React.Fragment key={`box-splitters-1-${box.id}`}>
+                              {box.splitters
+                                .filter(splitter => splitter.level === 1)
+                                .map(splitter => (
+                                  <li
+                                    key={splitter.id}
+                                    style={{
+                                      padding: '3px 0',
+                                      color: '#333',
+                                      cursor: 'default'
+                                    }}
+                                  >
+                                    Бокс №{box.number || 'Без номера'} - Сплиттер №{splitter.number}
+                                  </li>
+                                ))}
+                            </React.Fragment>
+                          ))}
+                        </ul>
+                      </li>
+
+                      {/* Сплиттеры 2-го уровня */}
+                      <li style={{ marginTop: 5 }}>
+                        <b style={{ cursor: 'pointer', display: 'block' }}>
+                          Сплиттеры 2-го уровня ({boxes.reduce((acc, box) => acc + box.splitters.filter(s => s.level === 2).length, 0)})
+                        </b>
+                        <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
+                          {boxes.map(box => (
+                            <React.Fragment key={`box-splitters-2-${box.id}`}>
+                              {box.splitters
+                                .filter(splitter => splitter.level === 2)
+                                .map(splitter => (
+                                  <li
+                                    key={splitter.id}
+                                    style={{
+                                      padding: '3px 0',
+                                      color: '#333',
+                                      cursor: 'default'
+                                    }}
+                                  >
+                                    Бокс №{box.number || 'Без номера'} - Сплиттер №{splitter.number}
+                                  </li>
+                                ))}
+                            </React.Fragment>
+                          ))}
+                        </ul>
+                      </li>
+
+                      {/* Сплиттеры 3-го уровня */}
+                      <li style={{ marginTop: 5 }}>
+                        <b style={{ cursor: 'pointer', display: 'block' }}>
+                          Сплиттеры 3-го уровня ({boxes.reduce((acc, box) => acc + box.splitters.filter(s => s.level === 3).length, 0)})
+                        </b>
+                        <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
+                          {boxes.map(box => (
+                            <React.Fragment key={`box-splitters-3-${box.id}`}>
+                              {box.splitters
+                                .filter(splitter => splitter.level === 3)
+                                .map(splitter => (
+                                  <li
+                                    key={splitter.id}
+                                    style={{
+                                      padding: '3px 0',
+                                      color: '#333',
+                                      cursor: 'default'
+                                    }}
+                                  >
+                                    Бокс №{box.number || 'Без номера'} - Сплиттер №{splitter.number}
+                                  </li>
+                                ))}
+                            </React.Fragment>
+                          ))}
+                        </ul>
+                      </li>
+                    </ul>
+                  )}
+                </div>
+
                 {/* Кабели */}
                 <div style={{ marginBottom: 15 }}>
                   <b onClick={handleToggleCables} style={{ cursor: 'pointer', display: 'block', padding: '5px 0' }}>Кабели ({cables.length})</b>
@@ -1957,14 +2974,10 @@ function App() {
                         <React.Fragment key={box.id}>
                           <Marker
                             position={box.position}
-                            icon={getBoxIcon(box.number)}
+                            icon={getBoxIcon(box.number, box.status)} // Передаем status в getBoxIcon
                             draggable={true}
                             eventHandlers={{
                               dblclick: () => {
-                                if (clickTimeoutRef.current) {
-                                  clearTimeout(clickTimeoutRef.current);
-                                  clickTimeoutRef.current = null;
-                                }
                                 handleMarkerDblClick(box.id);
                               },
                               dragend: (e) => handleMarkerDragEnd(box.id, e as DragEndEvent),
@@ -1972,7 +2985,6 @@ function App() {
                                 if (addCableMode) {
                                   handleBoxClick(box.id, box.position);
                                 } else {
-                                  // Задержка, чтобы не сработал click после dblclick
                                   if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
                                   clickTimeoutRef.current = setTimeout(() => {
                                     handleSelectBox(box.id);
@@ -2121,11 +3133,21 @@ function App() {
             onClose={handleCloseDetails}
             cables={cables}
             boxes={boxes}
-            fiberConnections={fiberConnections}
-            selectedFiber={selectedFiber}
-            onFiberClick={handleFiberClick}
+            fiberConnections={fiberConnections} // Теперь это globalExternalConnections для CableDetailDialog
+            selectedConnectionPoint={selectedConnectionPoint}
+            onConnectionPointClick={handleConnectionPointClick}
             onRemoveFiberConnection={handleRemoveFiberConnection}
-            style={{ zIndex: 6000 }} // Увеличиваем z-index для окна бокса
+            onUpdateBoxSplitters={(boxId, newSplitters) => {
+              setBoxes(prevBoxes => prevBoxes.map(b => 
+                b.id === boxId ? { ...b, splitters: newSplitters } : b
+              ));
+            }}
+            onUpdateBoxInternalConnections={(boxId, newConnections) => {
+              setBoxes(prevBoxes => prevBoxes.map(b => 
+                b.id === boxId ? { ...b, internalFiberConnections: newConnections } : b
+              ));
+            }}
+            style={{ zIndex: 6000 }}
           />
         )}
 
@@ -2189,14 +3211,53 @@ function App() {
               return (
                 <>
                   <h3 style={{ marginTop: 0 }}>Свойства бокса</h3>
+                  {/* НОВОЕ ПОЛЕ: Состояние */}
+                  <div style={{ marginBottom: 10 }}>
+                    <label>Состояние:<br />
+                      <select
+                        value={box.status}
+                        onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, status: e.target.value as Box['status'] } : b))}
+                        style={{ width: '100%' }}
+                      >
+                        <option value="projected">Проектируемый</option>
+                        <option value="existing">Существующий</option>
+                      </select>
+                    </label>
+                  </div>
                   <div style={{ marginBottom: 10 }}>
                     <label>Номер бокса:<br />
                       <input value={box.number} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, number: e.target.value } : b))} style={{ width: '100%' }} />
                     </label>
                   </div>
+                  {/* НОВОЕ ПОЛЕ: Модель бокса */}
                   <div style={{ marginBottom: 10 }}>
-                    <label>Сплиттер:<br />
-                      <input value={box.splitter} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, splitter: e.target.value } : b))} style={{ width: '100%' }} />
+                    <label>Модель бокса:<br />
+                      <select
+                        value={box.model}
+                        onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, model: e.target.value as Box['model'] } : b))}
+                        style={{ width: '100%' }}
+                      >
+                        <option value="FOB-02-04-04LC">FOB-02-04-04LC</option>
+                        <option value="FOB-03-12-08LC">FOB-03-12-08LC</option>
+                        <option value="FOB-04-16-16LC">FOB-04-16-16LC</option>
+                        <option value="FOB-05-24-24LC">FOB-05-24-24LC</option>
+                        <option value="FOB-02-04-04SC">FOB-02-04-04SC</option>
+                        <option value="FOB-03-12-08SC">FOB-03-12-08SC</option>
+                        <option value="FOB-04-16-16SC">FOB-04-16-16SC</option>
+                        <option value="FOB-05-24-24SC">FOB-05-24-24SC</option>
+                        <option value="FOB-05-24">FOB-05-24</option>
+                      </select>
+                    </label>
+                  </div>
+                  {/* НОВЫЕ ПОЛЯ: № терминала (OLT) и № порта (OLT Port) */}
+                  <div style={{ marginBottom: 10 }}>
+                    <label>№ терминала (OLT):<br />
+                      <input value={box.oltTerminalNo} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, oltTerminalNo: e.target.value } : b))} style={{ width: '100%' }} />
+                    </label>
+                  </div>
+                  <div style={{ marginBottom: 10 }}>
+                    <label>№ порта (OLT Port):<br />
+                      <input value={box.oltPortNo} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, oltPortNo: e.target.value } : b))} style={{ width: '100%' }} />
                     </label>
                   </div>
                   <div style={{ marginBottom: 10 }}>
@@ -2209,11 +3270,29 @@ function App() {
                       <input value={box.place} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, place: e.target.value } : b))} style={{ width: '100%' }} />
                     </label>
                   </div>
+                  {/* РАЗДЕЛЕННЫЕ ПОЛЯ: Координаты */}
                   <div style={{ marginBottom: 10 }}>
-                    <label>Координаты:<br />
-                      <input value={`${box.position[0].toFixed(6)}, ${box.position[1].toFixed(6)}`} readOnly style={{ width: '100%', color: '#888' }} />
+                    <label>Широта:<br />
+                      <input value={box.position[0].toFixed(6)} readOnly style={{ width: '100%', color: '#888' }} />
                     </label>
                   </div>
+                  <div style={{ marginBottom: 10 }}>
+                    <label>Долгота:<br />
+                      <input value={box.position[1].toFixed(6)} readOnly style={{ width: '100%', color: '#888' }} />
+                    </label>
+                  </div>
+
+                  {/* НОВАЯ СЕКЦИЯ: Список сплиттеров в боксе */}
+                  {box.splitters.length > 0 && (
+                    <div style={{ marginTop: 20, borderTop: '1px dashed #eee', paddingTop: 15 }}>
+                      <h4 style={{ marginTop: 0, marginBottom: 10 }}>Установленные сплиттеры:</h4>
+                      {box.splitters.map((splitter, idx) => (
+                        <div key={splitter.id} style={{ marginBottom: 8, fontSize: '13px', lineHeight: '1.4' }}>
+                          <strong>Сплиттер {idx + 1}:</strong> Уровень {splitter.level}, Номер: {splitter.number || 'не задан'}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </>
               );
             })()}
@@ -2326,40 +3405,42 @@ function App() {
           </div>
         )}
 
-        {newBoxPosition && (
+        {/* Форма создания бокса */}
+        {addBoxMode && newBoxPosition && (
           <div style={{
-            position: "absolute", 
-            top: "30%", 
-            left: "50%", 
-            transform: "translate(-50%, -30%)",
-            background: "#fff", 
-            padding: 24, 
-            borderRadius: 10, 
-            boxShadow: "0 2px 12px rgba(0,0,0,0.3)", 
-            zIndex: 4000
+            position: 'fixed', // Это правильно, для центрирования по экрану
+            top: '50%',       // Центрируем по вертикали
+            left: '50%',      // Центрируем по горизонтали
+            transform: 'translate(-50%, -50%)', // Точное центрирование по осям X и Y
+            background: 'white',
+            padding: '20px',
+            border: '1px solid #ccc',
+            borderRadius: '4px',
+            boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
+            zIndex: 4000 // Увеличим zIndex, чтобы оно было поверх всего
           }}>
-            <h3>Параметры бокса</h3>
-            <div>
+            <h3 style={{ marginTop: 0, marginBottom: '15px' }}>Параметры бокса</h3> {/* Добавил заголовок */}
+            <div style={{ marginBottom: '10px' }}>
               <label>
-                Номер: <input value={boxParams.number} onChange={e => setBoxParams({ ...boxParams, number: e.target.value })} />
+                Номер бокса: <input value={boxParams.number} onChange={e => setBoxParams({ ...boxParams, number: e.target.value })} />
               </label>
             </div>
-            <div>
+            <div style={{ marginBottom: '10px' }}>
               <label>
-                Сплиттер: <input value={boxParams.splitter} onChange={e => setBoxParams({ ...boxParams, splitter: e.target.value })} />
+                Адрес установки: <input value={boxParams.address} onChange={e => setBoxParams({ ...boxParams, address: e.target.value })} />
               </label>
             </div>
-            <div>
-              <label>
-                Адрес: <input value={boxParams.address} onChange={e => setBoxParams({ ...boxParams, address: e.target.value })} />
-              </label>
-            </div>
-            <div>
+            <div style={{ marginBottom: '15px' }}>
               <label>
                 Место установки: <input value={boxParams.place} onChange={e => setBoxParams({ ...boxParams, place: e.target.value })} />
               </label>
             </div>
-            <button onClick={handleSaveBox}>Сохранить</button>
+            <button onClick={handleSaveBox} style={{ padding: '8px 15px', cursor: 'pointer' }}>Сохранить</button>
+            <button onClick={() => {
+              setNewBoxPosition(null); // Сбросить позицию
+              setAddBoxMode(false);   // Выйти из режима добавления
+              setBoxParams({ number: "", address: "", place: "" }); // Очистить поля
+            }} style={{ marginLeft: '10px', padding: '8px 15px', cursor: 'pointer', background: '#ccc' }}>Отмена</button> {/* Добавил кнопку Отмена */}
           </div>
         )}
 
