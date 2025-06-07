@@ -433,7 +433,7 @@ function CableDetailDialog({
 
 function Toolbar({ onAddBox, onAddCable, cableMode, onExportToKMZ, onAddPole, poleMode, onAddWell, wellMode }: { onAddBox: () => void, onAddCable: () => void, cableMode: boolean, onExportToKMZ: () => void, onAddPole: () => void, poleMode: boolean, onAddWell: () => void, wellMode: boolean }) {
   return (
-    <div style={{ position: "absolute", top: 10, left: 10, zIndex: 1000, background: "#fff", padding: 10, borderRadius: 8, boxShadow: "0 2px 8px rgba(0,0,0,0.15)" }}>
+    <div style={{ position: "absolute", top: 10, left: 80, zIndex: 1000, background: "#fff", padding: 10, borderRadius: 8, boxShadow: "0 2px 8px rgba(0,0,0,0.15)" }}>
       <button onClick={onAddBox}>Добавить бокс</button>
       <button onClick={onAddCable} style={{ background: cableMode ? '#e0e0e0' : undefined, marginLeft: 8 }}>Добавить кабель</button>
       <button onClick={onAddPole} style={{ background: poleMode ? '#e0e0e0' : undefined, marginLeft: 8 }}>Опора</button>
@@ -1691,7 +1691,7 @@ function App() {
             <AddPoleOnMap onMapClick={handleMapClickPole} enabled={addPoleMode} />
             <AddWellOnMap onMapClick={handleMapClickWell} enabled={addWellMode} />
 
-            <LayersControl position="topright">
+            <LayersControl position="topleft">
               <LayersControl.Overlay name="Кабели" checked>
                 <LayerGroup>
                   {/* Существующие кабели */}
