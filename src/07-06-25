@@ -6,6 +6,7 @@ import { useRef, useEffect, useState } from 'react';
 import JSZip from 'jszip';
 import * as XLSX from 'xlsx'; // <-- Импортируем библиотеку xlsx
 import { saveAs } from 'file-saver'; // <-- Импортируем saveAs из file-saver
+import Tabs from './components/Tabs';
 
 // Тип для структуры волокна и модуля
 interface FiberStructure {
@@ -56,6 +57,7 @@ interface CableDetailDialogProps {
   } | null;
   onFiberClick: (cableId: string, fiberIdx: number, direction: 'in' | 'out') => void;
   onRemoveFiberConnection: (idx: number) => void;
+  style?: React.CSSProperties;
 }
 
 // Тип для цветов ODESA
@@ -115,7 +117,8 @@ function CableDetailDialog({
   fiberConnections,
   selectedFiber,
   onFiberClick,
-  onRemoveFiberConnection
+  onRemoveFiberConnection,
+  style
 }: CableDetailDialogProps) {
   const [maxHeight, setMaxHeight] = useState(600);
   const [rowHeight] = useState(24); // Высота строки для расчетов
@@ -238,7 +241,8 @@ function CableDetailDialog({
       overflow: 'hidden',
       display: 'flex',
       flexDirection: 'column',
-      zIndex: 1000
+      zIndex: 1000,
+      ...style
     }}>
       {/* Заголовок */}
       <div style={{ 
@@ -671,6 +675,21 @@ function App() {
   const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
   const [isAnalysisMenuOpen, setIsAnalysisMenuOpen] = useState(false); // <-- Добавил состояние для "Анализ"
 
+  const [activeTab, setActiveTab] = useState('situational');
+
+  const tabs = [
+    { id: 'situational', label: 'Ситуационный план' },
+    { id: 'network', label: 'Структура сети' },
+    { id: 'splicing', label: 'Схема розварки' }, // Добавляем новую вкладку
+    { id: 'house', label: 'Домовые сети' },
+    { id: 'materials', label: 'Спецификация материалов' },
+    { id: 'works', label: 'Спецификация работ' },
+  ];
+
+  const handleTabChange = (tabId: string) => {
+    setActiveTab(tabId);
+  };
+
   useEffect(() => {
     const handleResize = () => {
       setViewportWidth(window.innerWidth);
@@ -788,31 +807,27 @@ function App() {
 
   const handleMarkerDragEnd = (boxId: number, e: DragEndEvent) => {
     const { lat, lng } = (e.target as L.Marker).getLatLng();
-    setBoxes(boxes => boxes.map(box =>
-      box.id === boxId ? { ...box, position: [lat, lng] as [number, number] } : box
+    
+    // Обновляем позицию бокса
+    setBoxes(boxes => boxes.map(b =>
+      b.id === boxId ? { ...b, position: [lat, lng] } : b
     ));
+
+    // Обновляем точки кабелей, связанных с этим боксом
     setCables(cables => cables.map(cable => {
-      let updated = false;
-      const newPoints = [...cable.points];
+      // Если бокс является началом кабеля
       if (cable.sourceBoxId === boxId) {
-        const ap = boxes.find(b => b.id === boxId)?.connections.outputs.find((_, idx) => idx === 0);
-        if (ap) {
-          const offsetLat = 0;
-          const offsetLng = ATTACHMENT_OFFSET;
-          newPoints[0] = [lat + offsetLat, lng + offsetLng];
-          updated = true;
-        }
+        const newPoints = [...cable.points];
+        newPoints[0] = [lat, lng]; // Обновляем первую точку
+        return { ...cable, points: newPoints };
       }
+      // Если бокс является концом кабеля
       if (cable.targetBoxId === boxId) {
-        const ap = boxes.find(b => b.id === boxId)?.connections.input;
-        if (ap) {
-          const offsetLat = 0;
-          const offsetLng = -ATTACHMENT_OFFSET;
-          newPoints[newPoints.length - 1] = [lat + offsetLat, lng + offsetLng];
-          updated = true;
-        }
+        const newPoints = [...cable.points];
+        newPoints[newPoints.length - 1] = [lat, lng]; // Обновляем последнюю точку
+        return { ...cable, points: newPoints };
       }
-      return updated ? { ...cable, points: newPoints } : cable;
+      return cable;
     }));
   };
 
@@ -877,52 +892,21 @@ function App() {
   const handleSaveCableWithParams = () => {
     if (!cableStart || !cableEnd) return;
 
-    const newCable: Cable = {
-      id: Date.now(),
-      points: [cableStart.position, ...cablePoints, cableEnd.position],
+    const newCable = {
+      id: cables.length + 1, // Просто берем следующий номер после последнего кабеля
+      points: cablePoints,
       sourceBoxId: cableStart.boxId,
       targetBoxId: cableEnd.boxId,
       fiberCount: newCableParams.fiberCount,
       layingType: newCableParams.layingType
     };
 
-    // Обновляем боксы с новыми подключениями
-    setBoxes(prevBoxes =>
-      prevBoxes.map(box => {
-        if (box.id === cableStart.boxId) {
-          const outputIndex = box.connections.outputs.findIndex(output => output === null);
-          const newOutputs = [...box.connections.outputs];
-          newOutputs[outputIndex] = { cableId: newCable.id };
-          return {
-            ...box,
-            connections: {
-              ...box.connections,
-              outputs: newOutputs
-            }
-          };
-        }
-        if (box.id === cableEnd.boxId) {
-          return {
-            ...box,
-            connections: {
-              ...box.connections,
-              input: { cableId: newCable.id }
-            }
-          };
-        }
-        return box;
-      })
-    );
-
-    // Добавляем новый кабель
-    setCables(prevCables => [...prevCables, newCable]);
-
-    // Сбрасываем состояния
-    setCableStart(null);
-    setCablePoints([]);
-    setCableEnd(null);
-    setAddCableMode(false);
+    setCables([...cables, newCable]);
     setShowCableParamsModal(false);
+    setAddCableMode(false);
+    setCableStart(null);
+    setCableEnd(null);
+    setCablePoints([]);
   };
 
   // Drag промежуточных точек
@@ -1256,20 +1240,29 @@ function App() {
     setIsProtocolsMenuOpen(false);
     setIsExportMenuOpen(false);
     setIsAnalysisMenuOpen(false); // <-- Добавляем закрытие меню "Анализ"
+    setIsImportMenuOpen(false); // Добавляем закрытие меню импорта
   };
 
   // === Функции для экспорта в Excel ===
   const handleExportBoxReport = () => {
-    const boxData = boxes.map(box => ({
-      ID: box.id,
-      Номер: box.number,
-      Сплиттер: box.splitter,
-      Адрес: box.address,
-      Место: box.place,
-      Координаты: `${box.position[0].toFixed(6)}, ${box.position[1].toFixed(6)}`,
-      Входящий_кабель_ID: box.connections.input ? box.connections.input.cableId : '',
-      Исходящие_кабели_ID: box.connections.outputs.map(out => out ? out.cableId : '').join(', ')
-    }));
+    const boxData = boxes.map(box => {
+      // Находим входящий кабель
+      const incomingCable = cables.find(cable => cable.targetBoxId === box.id);
+      
+      // Находим исходящие кабели
+      const outgoingCables = cables.filter(cable => cable.sourceBoxId === box.id);
+
+      return {
+        ID: box.id,
+        Номер: box.number,
+        Сплиттер: box.splitter,
+        Адрес: box.address,
+        Место: box.place,
+        Координаты: `${box.position[0].toFixed(6)}, ${box.position[1].toFixed(6)}`,
+        Входящий_кабель_ID: incomingCable ? incomingCable.id : '',
+        Исходящие_кабели_ID: outgoingCables.map(c => c.id).join(', ')
+      };
+    });
 
     const worksheet = XLSX.utils.json_to_sheet(boxData);
     const workbook = XLSX.utils.book_new();
@@ -1310,6 +1303,157 @@ function App() {
   };
   // === Конец функций для экспорта в Excel ===
 
+  // Добавляем новое состояние для меню импорта
+  const [isImportMenuOpen, setIsImportMenuOpen] = useState(false);
+
+  // Добавляем функцию переключения меню импорта
+  const toggleImportMenu = () => {
+    setIsImportMenuOpen(prevState => !prevState);
+    setIsFileMenuOpen(false);
+    setIsPassportsMenuOpen(false);
+    setIsProtocolsMenuOpen(false);
+    setIsExportMenuOpen(false);
+    setIsAnalysisMenuOpen(false);
+  };
+
+  // Добавляем функции для импорта
+  const handleImportBoxReport = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.xlsx';
+    
+    input.onchange = (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const data = new Uint8Array(event.target?.result as ArrayBuffer);
+          const workbook = XLSX.read(data, { type: 'array' });
+          const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+          const jsonData = XLSX.utils.sheet_to_json(worksheet);
+
+          if (!jsonData || jsonData.length === 0) {
+            alert('Файл не содержит данных');
+            return;
+          }
+
+          // Обновляем боксы
+          const newBoxes = jsonData.map((row: any) => {
+            if (!row.Координаты) {
+              throw new Error('Отсутствуют координаты в данных');
+            }
+
+            const [lat, lng] = row.Координаты.split(',').map((coord: string) => {
+              const num = parseFloat(coord.trim());
+              if (isNaN(num)) {
+                throw new Error('Некорректный формат координат');
+              }
+              return num;
+            });
+
+            return {
+              id: row.ID || Math.max(...boxes.map(b => b.id), 0) + 1,
+              position: [lat, lng] as [number, number],
+              number: row.Номер || '',
+              splitter: row.Сплиттер || '',
+              address: row.Адрес || '',
+              place: row.Место || '',
+              connections: {
+                input: row.Входящий_кабель_ID ? { cableId: row.Входящий_кабель_ID } : null,
+                outputs: row.Исходящие_кабели_ID ? 
+                  row.Исходящие_кабели_ID.split(',').map((id: string) => ({ cableId: parseInt(id.trim()) })) : 
+                  Array(6).fill(null)
+              }
+            };
+          });
+
+          setBoxes(newBoxes);
+          alert(`Успешно импортировано ${newBoxes.length} боксов`);
+        } catch (error: unknown) {
+          if (error instanceof Error) {
+            alert(`Ошибка при импорте: ${error.message}`);
+          } else {
+            alert('Произошла неизвестная ошибка при импорте');
+          }
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    };
+    
+    input.click();
+  };
+
+  const handleImportCableReport = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.xlsx';
+    
+    input.onchange = (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const data = new Uint8Array(event.target?.result as ArrayBuffer);
+          const workbook = XLSX.read(data, { type: 'array' });
+          const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+          const jsonData = XLSX.utils.sheet_to_json(worksheet);
+
+          if (!jsonData || jsonData.length === 0) {
+            alert('Файл не содержит данных');
+            return;
+          }
+
+          // Обновляем кабели
+          const newCables = jsonData.map((row: any) => {
+            if (!row.Координаты_точек) {
+              throw new Error('Отсутствуют координаты точек в данных');
+            }
+
+            const points = row.Координаты_точек.split(';').map((point: string) => {
+              const [lat, lng] = point.replace(/[()]/g, '').split(',').map(coord => {
+                const num = parseFloat(coord.trim());
+                if (isNaN(num)) {
+                  throw new Error('Некорректный формат координат');
+                }
+                return num;
+              });
+              return [lat, lng] as [number, number];
+            });
+
+            if (points.length < 2) {
+              throw new Error('Кабель должен иметь минимум 2 точки');
+            }
+
+            return {
+              id: row.ID || Math.max(...cables.map(c => c.id), 0) + 1,
+              sourceBoxId: row['Источник (Бокс ID)'] || null,
+              targetBoxId: row['Назначение (Бокс ID)'] || null,
+              fiberCount: row.Волоконность || 4,
+              layingType: row['Тип прокладки'] || 'подвес',
+              points: points
+            };
+          });
+
+          setCables(newCables);
+          alert(`Успешно импортировано ${newCables.length} кабелей`);
+        } catch (error: unknown) {
+          if (error instanceof Error) {
+            alert(`Ошибка при импорте: ${error.message}`);
+          } else {
+            alert('Произошла неизвестная ошибка при импорте');
+          }
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    };
+    
+    input.click();
+  };
+
   return (
     <div style={{
       display: 'flex',
@@ -1317,9 +1461,7 @@ function App() {
       height: '100vh',
       width: '100vw',
       overflow: 'hidden'
-    }}
-    // onClick={closeAllMenus} // Закрывать меню при клике в любом другом месте (кроме самого меню)
-    >
+    }}>
       {/* Верхняя панель с названием проекта */}
       <div style={{
         backgroundColor: '#094961',
@@ -1473,6 +1615,55 @@ function App() {
           )}
         </div>
 
+        {/* Пункт меню "Импорт" */}
+        <div style={{ position: 'relative' }}>
+          <span
+            onClick={toggleImportMenu}
+            style={{ cursor: 'pointer', fontWeight: '500', color: '#333', userSelect: 'none' }}
+          >
+            Импорт
+          </span>
+          {isImportMenuOpen && (
+            <div style={{
+              position: 'absolute',
+              top: '100%',
+              left: 0,
+              backgroundColor: '#fff',
+              border: '1px solid #ddd',
+              borderRadius: '4px',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+              padding: '8px 0',
+              zIndex: 2001,
+              minWidth: '220px',
+              display: 'flex',
+              flexDirection: 'column'
+            }}>
+              <span
+                style={{
+                  padding: '6px 15px',
+                  cursor: 'pointer',
+                  color: '#333',
+                  fontSize: '14px',
+                }}
+                onClick={handleImportBoxReport}
+              >
+                Импорт Отчет_Бокс.xlsx
+              </span>
+              <span
+                style={{
+                  padding: '6px 15px',
+                  cursor: 'pointer',
+                  color: '#333',
+                  fontSize: '14px',
+                }}
+                onClick={handleImportCableReport}
+              >
+                Импорт Отчет_ВОК.xlsx
+              </span>
+            </div>
+          )}
+        </div>
+
         {/* Пункт меню "Экспорт" */}
         <div style={{ position: 'relative' }}>
            <span
@@ -1539,346 +1730,389 @@ function App() {
 
       </div>
 
+      {/* Вкладки */}
+      <Tabs tabs={tabs} onTabChange={handleTabChange} />
+
       {/* Основной контейнер для остального содержимого */}
       <div style={{
         display: 'flex',
         flex: 1,
         overflow: 'hidden'
       }}>
-        {/* Левая панель с деревом объектов */}
-        <div style={{
-          width: 300,
-          background: '#f8f8f8',
-          borderRight: '1px solid #ddd',
-          padding: '10px 0',
-          overflowY: 'auto',
-          zIndex: 1000,
-          flexShrink: 0
-        }}>
-          <div style={{ padding: '0 15px' }}>
-            <h3 style={{ marginTop: 0, marginBottom: 10 }}>Элементы</h3>
+        {activeTab === 'situational' && (
+          <>
+            {/* Левая панель с деревом объектов */}
+            <div style={{
+              width: 300,
+              background: '#f8f8f8',
+              borderRight: '1px solid #ddd',
+              padding: '10px 0',
+              overflowY: 'auto',
+              zIndex: 1000,
+              flexShrink: 0
+            }}>
+              <div style={{ padding: '0 15px' }}>
+                <h3 style={{ marginTop: 0, marginBottom: 10 }}>Элементы</h3>
 
-            {/* Боксы */}
-            <div style={{ marginBottom: 15 }}>
-              <b onClick={handleToggleBoxes} style={{ cursor: 'pointer', display: 'block', padding: '5px 0' }}>Боксы ({boxes.length})</b>
-              {boxesOpen && (
-                <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
-                  {boxes.map(box => (
-                    <li
-                      key={box.id}
-                      onClick={() => handleSelectBox(box.id)}
-                      style={{
-                        cursor: 'pointer',
-                        padding: '3px 0',
-                        color: selectedElement?.type === 'box' && selectedElement.id === box.id ? '#0070c0' : '#333',
-                        fontWeight: selectedElement?.type === 'box' && selectedElement.id === box.id ? 'bold' : 'normal'
-                      }}
-                    >
-                      №{box.number || 'Без номера'} ({box.position[0].toFixed(5)}, {box.position[1].toFixed(5)})
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-
-            {/* Кабели */}
-            <div style={{ marginBottom: 15 }}>
-              <b onClick={handleToggleCables} style={{ cursor: 'pointer', display: 'block', padding: '5px 0' }}>Кабели ({cables.length})</b>
-              {cablesOpen && (
-                <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
-                  {cables.map(cable => (
-                    <li
-                      key={cable.id}
-                      onClick={() => handleSelectCable(cable.id)}
-                      style={{
-                        cursor: 'pointer',
-                        padding: '3px 0',
-                        color: selectedElement?.type === 'cable' && selectedElement.id === cable.id ? '#0070c0' : '#333',
-                        fontWeight: selectedElement?.type === 'cable' && selectedElement.id === cable.id ? 'bold' : 'normal'
-                      }}
-                    >
-                      ID: {cable.id} ({cable.fiberCount} вол.)
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-
-            {/* Опоры */}
-            <div style={{ marginBottom: 15 }}>
-              <b onClick={handleTogglePoles} style={{ cursor: 'pointer', display: 'block', padding: '5px 0' }}>Опоры ({poles.length})</b>
-              {polesOpen && (
-                <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
-                  {poles.map(pole => (
-                    <li
-                      key={pole.id}
-                      onClick={() => handleSelectPole(pole.id)}
-                      style={{
-                        cursor: 'pointer',
-                        padding: '3px 0',
-                        color: selectedElement?.type === 'pole' && selectedElement.id === pole.id ? '#0070c0' : '#333',
-                        fontWeight: selectedElement?.type === 'pole' && selectedElement.id === pole.id ? 'bold' : 'normal'
-                      }}
-                    >
-                      №{pole.number || 'Без номера'} ({pole.position[0].toFixed(5)}, {pole.position[1].toFixed(5)})
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-
-            {/* Колодцы */}
-            <div style={{ marginBottom: 15 }}>
-              <b onClick={handleToggleWells} style={{ cursor: 'pointer', display: 'block', padding: '5px 0' }}>Колодцы ({wells.length})</b>
-              {wellsOpen && (
-                <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
-                  {wells.map(well => (
-                    <li
-                      key={well.id}
-                      onClick={() => handleSelectWell(well.id)}
-                      style={{
-                        cursor: 'pointer',
-                        padding: '3px 0',
-                        color: selectedElement?.type === 'well' && selectedElement.id === well.id ? '#0070c0' : '#333',
-                        fontWeight: selectedElement?.type === 'well' && selectedElement.id === well.id ? 'bold' : 'normal'
-                      }}
-                    >
-                      №{well.number || 'Без номера'} ({well.position[0].toFixed(5)}, {well.position[1].toFixed(5)})
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-
-          </div>
-        </div>
-
-        {/* Контейнер для карты и остальных элементов */}
-        <div style={{ position: 'relative', flexGrow: 1, overflow: 'hidden' }}>
-          <Toolbar
-            onAddBox={() => setAddBoxMode(true)}
-            onAddCable={() => {
-              setAddCableMode(true);
-              setCableStart(null);
-              setCablePoints([]);
-              setCableEnd(null);
-            }}
-            cableMode={addCableMode}
-            onExportToKMZ={handleExportToKMZ}
-            onAddPole={() => setAddPoleMode(m => !m)}
-            poleMode={addPoleMode}
-            onAddWell={() => setAddWellMode(m => !m)}
-            wellMode={addWellMode}
-          />
-          <MapContainer
-            center={[48.3794, 31.1656]}
-            zoom={17}
-            style={{ height: "100%", width: "100%" }}
-            zoomControl={false} // Отключаем дефолтный ZoomControl
-          >
-            <TileLayer
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            />
-            <ScaleControl position="bottomright" /> {/* Полоса масштаба внизу справа */}
-            <ZoomControl position="bottomright" /> {/* Кнопки масштабирования внизу справа, добавленные нами */}
-
-            <AddBoxOnMap onMapClick={handleMapClick} enabled={addBoxMode} />
-            <AddCableOnMap
-              onMapClick={handleCableMapClick}
-              enabled={addCableMode && !!cableStart && !cableEnd}
-            />
-            <AddPoleOnMap onMapClick={handleMapClickPole} enabled={addPoleMode} />
-            <AddWellOnMap onMapClick={handleMapClickWell} enabled={addWellMode} />
-
-            <LayersControl position="topleft">
-              <LayersControl.Overlay name="Кабели" checked>
-                <LayerGroup>
-                  {/* Существующие кабели */}
-                  {cables.map(cable => (
-                    <React.Fragment key={cable.id}>
-                      <Polyline
-                        key={cable.id + '-' + cable.fiberCount + '-' + cable.layingType}
-                        positions={cable.points as LatLngExpression[]}
-                        color={
-                          cable.fiberCount === 4 ? "#000"
-                          : cable.fiberCount === 8 ? "#ff0000"
-                          : cable.fiberCount === 12 ? "#00b050"
-                          : cable.fiberCount === 24 ? "#0070c0"
-                          : cable.fiberCount === 48 ? "#ff9900"
-                          : cable.fiberCount === 96 ? "#703000"
-                          : cable.fiberCount === 144 ? "#7030a0"
-                          : "green"
-                        }
-                        dashArray={cable.layingType === "канализация" ? "6 6" : undefined}
-                        weight={4}
-                        eventHandlers={{ click: () => handleSelectCable(cable.id) }}
-                      >
-                        {cable.points.length > 1 && (
-                          <Tooltip
-                            position={getPolylineMiddlePoint(cable.points)}
-                            direction="top"
-                            offset={[0, -10]}
-                            permanent
-                            opacity={0.85}
-                            interactive={false}
-                          >
-                            <span style={{ fontSize: 13, fontWeight: 600 }}>
-                              {calculateCableLength(cable.points).toFixed(1)} м
-                            </span>
-                          </Tooltip>
-                        )}
-                      </Polyline>
-                      {/* Drag-ручки на промежуточных точках (кроме концов) для выбранного кабеля */}
-                      {selectedElement?.type === 'cable' && selectedElement.id === cable.id && cable.points.slice(1, -1).map((pt, idx) => (
-                        <Marker
-                          key={idx}
-                          position={pt}
-                          icon={getCablePointIcon(false)}
-                          draggable={true}
-                          eventHandlers={{
-                            dragend: (e) => handleCablePointDragEnd(cable.id, idx + 1, e as DragEndEvent)
+                {/* Боксы */}
+                <div style={{ marginBottom: 15 }}>
+                  <b onClick={handleToggleBoxes} style={{ cursor: 'pointer', display: 'block', padding: '5px 0' }}>Боксы ({boxes.length})</b>
+                  {boxesOpen && (
+                    <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
+                      {boxes.map(box => (
+                        <li
+                          key={box.id}
+                          onClick={() => handleSelectBox(box.id)}
+                          style={{
+                            cursor: 'pointer',
+                            padding: '3px 0',
+                            color: selectedElement?.type === 'box' && selectedElement.id === box.id ? '#0070c0' : '#333',
+                            fontWeight: selectedElement?.type === 'box' && selectedElement.id === box.id ? 'bold' : 'normal'
                           }}
-                        />
+                        >
+                          №{box.number || 'Без номера'} ({box.position[0].toFixed(5)}, {box.position[1].toFixed(5)})
+                        </li>
                       ))}
-                    </React.Fragment>
-                  ))}
-                  {/* Строящийся кабель */}
-                  {addCableMode && cableStart && cablePoints.length > 0 && (
-                    <Polyline
-                      positions={cablePoints as LatLngExpression[]}
-                      color="orange"
-                      dashArray="6 6"
-                      weight={4}
-                    />
+                    </ul>
                   )}
-                </LayerGroup>
-              </LayersControl.Overlay>
-              <LayersControl.Overlay name="Боксы" checked>
-                <LayerGroup>
-                  {boxes.map((box) => (
-                    <React.Fragment key={box.id}>
-                      <Marker
-                        position={box.position}
-                        icon={getBoxIcon(box.number)}
-                        draggable={true}
-                        eventHandlers={{
-                          dblclick: () => {
-                            if (clickTimeoutRef.current) {
-                              clearTimeout(clickTimeoutRef.current);
-                              clickTimeoutRef.current = null;
+                </div>
+
+                {/* Кабели */}
+                <div style={{ marginBottom: 15 }}>
+                  <b onClick={handleToggleCables} style={{ cursor: 'pointer', display: 'block', padding: '5px 0' }}>Кабели ({cables.length})</b>
+                  {cablesOpen && (
+                    <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
+                      {cables.map(cable => (
+                        <li
+                          key={cable.id}
+                          onClick={() => handleSelectCable(cable.id)}
+                          style={{
+                            cursor: 'pointer',
+                            padding: '3px 0',
+                            color: selectedElement?.type === 'cable' && selectedElement.id === cable.id ? '#0070c0' : '#333',
+                            fontWeight: selectedElement?.type === 'cable' && selectedElement.id === cable.id ? 'bold' : 'normal'
+                          }}
+                        >
+                          ID: {cable.id} ({cable.fiberCount} вол.)
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                {/* Опоры */}
+                <div style={{ marginBottom: 15 }}>
+                  <b onClick={handleTogglePoles} style={{ cursor: 'pointer', display: 'block', padding: '5px 0' }}>Опоры ({poles.length})</b>
+                  {polesOpen && (
+                    <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
+                      {poles.map(pole => (
+                        <li
+                          key={pole.id}
+                          onClick={() => handleSelectPole(pole.id)}
+                          style={{
+                            cursor: 'pointer',
+                            padding: '3px 0',
+                            color: selectedElement?.type === 'pole' && selectedElement.id === pole.id ? '#0070c0' : '#333',
+                            fontWeight: selectedElement?.type === 'pole' && selectedElement.id === pole.id ? 'bold' : 'normal'
+                          }}
+                        >
+                          №{pole.number || 'Без номера'} ({pole.position[0].toFixed(5)}, {pole.position[1].toFixed(5)})
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                {/* Колодцы */}
+                <div style={{ marginBottom: 15 }}>
+                  <b onClick={handleToggleWells} style={{ cursor: 'pointer', display: 'block', padding: '5px 0' }}>Колодцы ({wells.length})</b>
+                  {wellsOpen && (
+                    <ul style={{ listStyle: 'none', paddingLeft: 15, margin: 0 }}>
+                      {wells.map(well => (
+                        <li
+                          key={well.id}
+                          onClick={() => handleSelectWell(well.id)}
+                          style={{
+                            cursor: 'pointer',
+                            padding: '3px 0',
+                            color: selectedElement?.type === 'well' && selectedElement.id === well.id ? '#0070c0' : '#333',
+                            fontWeight: selectedElement?.type === 'well' && selectedElement.id === well.id ? 'bold' : 'normal'
+                          }}
+                        >
+                          №{well.number || 'Без номера'} ({well.position[0].toFixed(5)}, {well.position[1].toFixed(5)})
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+              </div>
+            </div>
+
+            {/* Контейнер для карты и остальных элементов */}
+            <div style={{ position: 'relative', flexGrow: 1, overflow: 'hidden' }}>
+              <Toolbar
+                onAddBox={() => setAddBoxMode(true)}
+                onAddCable={() => {
+                  setAddCableMode(true);
+                  setCableStart(null);
+                  setCablePoints([]);
+                  setCableEnd(null);
+                }}
+                cableMode={addCableMode}
+                onExportToKMZ={handleExportToKMZ}
+                onAddPole={() => setAddPoleMode(m => !m)}
+                poleMode={addPoleMode}
+                onAddWell={() => setAddWellMode(m => !m)}
+                wellMode={addWellMode}
+              />
+              <MapContainer
+                center={[50.45086, 30.52281]} // Координаты центра карты (Киев)
+                zoom={16}
+                style={{ height: "100%", width: "100%" }}
+                zoomControl={false} // Отключаем дефолтный ZoomControl
+              >
+                <TileLayer
+                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                  maxZoom={19} // Добавляем или изменяем свойство maxZoom
+                />
+                <ScaleControl position="bottomright" /> {/* Полоса масштаба внизу справа */}
+                <ZoomControl position="bottomright" /> {/* Кнопки масштабирования внизу справа, добавленные нами */}
+
+                <AddBoxOnMap onMapClick={handleMapClick} enabled={addBoxMode} />
+                <AddCableOnMap
+                  onMapClick={handleCableMapClick}
+                  enabled={addCableMode && !!cableStart && !cableEnd}
+                />
+                <AddPoleOnMap onMapClick={handleMapClickPole} enabled={addPoleMode} />
+                <AddWellOnMap onMapClick={handleMapClickWell} enabled={addWellMode} />
+
+                <LayersControl position="topleft">
+                  <LayersControl.Overlay name="Кабели" checked>
+                    <LayerGroup>
+                      {/* Существующие кабели */}
+                      {cables.map(cable => (
+                        <React.Fragment key={cable.id}>
+                          <Polyline
+                            key={cable.id + '-' + cable.fiberCount + '-' + cable.layingType}
+                            positions={cable.points as LatLngExpression[]}
+                            color={
+                              cable.fiberCount === 4 ? "#000"
+                              : cable.fiberCount === 8 ? "#ff0000"
+                              : cable.fiberCount === 12 ? "#00b050"
+                              : cable.fiberCount === 24 ? "#0070c0"
+                              : cable.fiberCount === 48 ? "#ff9900"
+                              : cable.fiberCount === 96 ? "#703000"
+                              : cable.fiberCount === 144 ? "#7030a0"
+                              : "green"
                             }
-                            handleMarkerDblClick(box.id);
-                          },
-                          dragend: (e) => handleMarkerDragEnd(box.id, e as DragEndEvent),
-                          click: () => {
-                            if (addCableMode) {
-                              handleBoxClick(box.id, box.position);
-                            } else {
-                              // Задержка, чтобы не сработал click после dblclick
-                              if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
-                              clickTimeoutRef.current = setTimeout(() => {
-                                handleSelectBox(box.id);
-                                clickTimeoutRef.current = null;
-                              }, 200);
-                            }
-                          }
-                        }}
-                      />
-                    </React.Fragment>
-                  ))}
-                </LayerGroup>
-              </LayersControl.Overlay>
-              <LayersControl.Overlay name="Опоры" checked>
-                <LayerGroup>
-                  {poles.map(pole => (
-                    <React.Fragment key={pole.id}>
-                      <Marker
-                        position={pole.position}
-                        icon={getPoleIcon(pole.purpose)}
-                        draggable={true}
-                        eventHandlers={{
-                          dragend: (e) => {
-                            const { lat, lng } = (e.target as L.Marker).getLatLng();
-                            setPoles(poles => poles.map(p =>
-                              p.id === pole.id ? { ...p, position: [lat, lng] } : p
-                            ));
-                          },
-                          click: () => handleSelectPole(pole.id)
-                        }}
-                      />
-                      {/* Подпись с номером опоры */}
-                      <Marker
-                        position={[pole.position[0] + pole.labelOffset[0] * 0.00001, pole.position[1] + pole.labelOffset[1] * 0.00001]}
-                        icon={new DivIcon({
-                          className: '',
-                          iconSize: [40, 20],
-                          iconAnchor: [20, 10],
-                          html: `<div style="font-size:15px;font-weight:bold;color:#222;cursor:move;">${pole.number || ''}</div>`
-                        })}
-                        draggable={true}
-                        eventHandlers={{
-                          dragstart: (e) => {
-                            const orig = (e as any).originalEvent;
-                            if (orig && typeof orig.clientX === 'number' && typeof orig.clientY === 'number') {
-                              handleLabelDragStart(pole.id, orig);
-                            }
-                          },
-                          dragend: (e) => handleLabelDragEnd(),
-                          click: () => handleSelectPole(pole.id)
-                        }}
-                      />
-                    </React.Fragment>
-                  ))}
-                </LayerGroup>
-              </LayersControl.Overlay>
-              <LayersControl.Overlay name="Колодцы" checked>
-                <LayerGroup>
-                  {wells.map(well => (
-                    <React.Fragment key={well.id}>
-                      <Marker
-                        position={well.position}
-                        icon={getWellIcon()}
-                        draggable={true}
-                        eventHandlers={{
-                          dragend: (e) => {
-                            const { lat, lng } = (e.target as L.Marker).getLatLng();
-                            setWells(wells => wells.map(w =>
-                              w.id === well.id ? { ...w, position: [lat, lng] } : w
-                            ));
-                          },
-                          click: () => handleSelectWell(well.id)
-                        }}
-                      />
-                      {/* Подпись с номером колодца */}
-                      <Marker
-                        position={[well.position[0] + well.labelOffset[0] * 0.00001, well.position[1] + well.labelOffset[1] * 0.00001]}
-                        icon={new DivIcon({
-                          className: '',
-                          iconSize: [40, 20],
-                          iconAnchor: [20, 10],
-                          html: `<div style="font-size:15px;font-weight:bold;color:#222;cursor:move;">${well.number || ''}</div>`
-                        })}
-                        draggable={true}
-                        eventHandlers={{
-                          dragstart: (e) => {
-                            const orig = (e as any).originalEvent;
-                            if (orig && typeof orig.clientX === 'number' && typeof orig.clientY === 'number') {
-                              setDraggedLabelPoleId(well.id);
-                              setLabelDragOffset([orig.clientX, orig.clientY]);
-                            }
-                          },
-                          dragend: (e) => handleLabelDragEnd(),
-                          click: () => handleSelectWell(well.id)
-                        }}
-                      />
-                    </React.Fragment>
-                  ))}
-                </LayerGroup>
-              </LayersControl.Overlay>
-            </LayersControl>
-          </MapContainer>
-        </div>
+                            dashArray={cable.layingType === "канализация" ? "6 6" : undefined}
+                            weight={4}
+                            eventHandlers={{ click: () => handleSelectCable(cable.id) }}
+                          >
+                            {cable.points.length > 1 && (
+                              <Tooltip
+                                position={getPolylineMiddlePoint(cable.points)}
+                                direction="top"
+                                offset={[0, -10]}
+                                permanent
+                                opacity={0.85}
+                                interactive={false}
+                              >
+                                <span style={{ fontSize: 13, fontWeight: 600 }}>
+                                  {calculateCableLength(cable.points).toFixed(1)} м
+                                </span>
+                              </Tooltip>
+                            )}
+                          </Polyline>
+                          {/* Drag-ручки на промежуточных точках (кроме концов) для выбранного кабеля */}
+                          {selectedElement?.type === 'cable' && selectedElement.id === cable.id && cable.points.slice(1, -1).map((pt, idx) => (
+                            <Marker
+                              key={idx}
+                              position={pt}
+                              icon={getCablePointIcon(false)}
+                              draggable={true}
+                              eventHandlers={{
+                                dragend: (e) => handleCablePointDragEnd(cable.id, idx + 1, e as DragEndEvent)
+                              }}
+                            />
+                          ))}
+                        </React.Fragment>
+                      ))}
+                      {/* Строящийся кабель */}
+                      {addCableMode && cableStart && cablePoints.length > 0 && (
+                        <Polyline
+                          positions={cablePoints as LatLngExpression[]}
+                          color="orange"
+                          dashArray="6 6"
+                          weight={4}
+                        />
+                      )}
+                    </LayerGroup>
+                  </LayersControl.Overlay>
+                  <LayersControl.Overlay name="Боксы" checked>
+                    <LayerGroup>
+                      {boxes.map((box) => (
+                        <React.Fragment key={box.id}>
+                          <Marker
+                            position={box.position}
+                            icon={getBoxIcon(box.number)}
+                            draggable={true}
+                            eventHandlers={{
+                              dblclick: () => {
+                                if (clickTimeoutRef.current) {
+                                  clearTimeout(clickTimeoutRef.current);
+                                  clickTimeoutRef.current = null;
+                                }
+                                handleMarkerDblClick(box.id);
+                              },
+                              dragend: (e) => handleMarkerDragEnd(box.id, e as DragEndEvent),
+                              click: () => {
+                                if (addCableMode) {
+                                  handleBoxClick(box.id, box.position);
+                                } else {
+                                  // Задержка, чтобы не сработал click после dblclick
+                                  if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+                                  clickTimeoutRef.current = setTimeout(() => {
+                                    handleSelectBox(box.id);
+                                    clickTimeoutRef.current = null;
+                                  }, 200);
+                                }
+                              }
+                            }}
+                          />
+                        </React.Fragment>
+                      ))}
+                    </LayerGroup>
+                  </LayersControl.Overlay>
+                  <LayersControl.Overlay name="Опоры" checked>
+                    <LayerGroup>
+                      {poles.map(pole => (
+                        <React.Fragment key={pole.id}>
+                          <Marker
+                            position={pole.position}
+                            icon={getPoleIcon(pole.purpose)}
+                            draggable={true}
+                            eventHandlers={{
+                              dragend: (e) => {
+                                const { lat, lng } = (e.target as L.Marker).getLatLng();
+                                setPoles(poles => poles.map(p =>
+                                  p.id === pole.id ? { ...p, position: [lat, lng] } : p
+                                ));
+                              },
+                              click: () => handleSelectPole(pole.id)
+                            }}
+                          />
+                          {/* Подпись с номером опоры */}
+                          <Marker
+                            position={[pole.position[0] + pole.labelOffset[0] * 0.00001, pole.position[1] + pole.labelOffset[1] * 0.00001]}
+                            icon={new DivIcon({
+                              className: '',
+                              iconSize: [40, 20],
+                              iconAnchor: [20, 10],
+                              html: `<div style="font-size:15px;font-weight:bold;color:#222;cursor:move;">${pole.number || ''}</div>`
+                            })}
+                            draggable={true}
+                            eventHandlers={{
+                              dragstart: (e) => {
+                                const orig = (e as any).originalEvent;
+                                if (orig && typeof orig.clientX === 'number' && typeof orig.clientY === 'number') {
+                                  handleLabelDragStart(pole.id, orig);
+                                }
+                              },
+                              dragend: (e) => handleLabelDragEnd(),
+                              click: () => handleSelectPole(pole.id)
+                            }}
+                          />
+                        </React.Fragment>
+                      ))}
+                    </LayerGroup>
+                  </LayersControl.Overlay>
+                  <LayersControl.Overlay name="Колодцы" checked>
+                    <LayerGroup>
+                      {wells.map(well => (
+                        <React.Fragment key={well.id}>
+                          <Marker
+                            position={well.position}
+                            icon={getWellIcon()}
+                            draggable={true}
+                            eventHandlers={{
+                              dragend: (e) => {
+                                const { lat, lng } = (e.target as L.Marker).getLatLng();
+                                setWells(wells => wells.map(w =>
+                                  w.id === well.id ? { ...w, position: [lat, lng] } : w
+                                ));
+                              },
+                              click: () => handleSelectWell(well.id)
+                            }}
+                          />
+                          {/* Подпись с номером колодца */}
+                          <Marker
+                            position={[well.position[0] + well.labelOffset[0] * 0.00001, well.position[1] + well.labelOffset[1] * 0.00001]}
+                            icon={new DivIcon({
+                              className: '',
+                              iconSize: [40, 20],
+                              iconAnchor: [20, 10],
+                              html: `<div style="font-size:15px;font-weight:bold;color:#222;cursor:move;">${well.number || ''}</div>`
+                            })}
+                            draggable={true}
+                            eventHandlers={{
+                              dragstart: (e) => {
+                                const orig = (e as any).originalEvent;
+                                if (orig && typeof orig.clientX === 'number' && typeof orig.clientY === 'number') {
+                                  setDraggedLabelPoleId(well.id);
+                                  setLabelDragOffset([orig.clientX, orig.clientY]);
+                                }
+                              },
+                              dragend: (e) => handleLabelDragEnd(),
+                              click: () => handleSelectWell(well.id)
+                            }}
+                          />
+                        </React.Fragment>
+                      ))}
+                    </LayerGroup>
+                  </LayersControl.Overlay>
+                </LayersControl>
+              </MapContainer>
+            </div>
+          </>
+        )}
+
+        {activeTab === 'network' && (
+          <div style={{ padding: 20 }}>
+            <h2>Структура сети</h2>
+            <p>Здесь будет отображаться информация о структуре сети.</p>
+          </div>
+        )}
+
+        {activeTab === 'splicing' && (
+          <div style={{ padding: 20 }}>
+            <h2>Схема розварки</h2>
+            <p>Здесь будет отображаться схема розварки волокон.</p>
+          </div>
+        )}
+
+        {activeTab === 'house' && (
+          <div style={{ padding: 20 }}>
+            <h2>Домовые сети</h2>
+            <p>Здесь будет отображаться информация о домовых сетях.</p>
+          </div>
+        )}
+
+        {activeTab === 'materials' && (
+          <div style={{ padding: 20 }}>
+            <h2>Спецификация материалов</h2>
+            <p>Здесь будет отображаться спецификация материалов.</p>
+          </div>
+        )}
+
+        {activeTab === 'works' && (
+          <div style={{ padding: 20 }}>
+            <h2>Спецификация работ</h2>
+            <p>Здесь будет отображаться спецификация работ.</p>
+          </div>
+        )}
 
         {/* Диалог с деталями бокса */}
         {openedBoxId !== null && (
@@ -1891,6 +2125,7 @@ function App() {
             selectedFiber={selectedFiber}
             onFiberClick={handleFiberClick}
             onRemoveFiberConnection={handleRemoveFiberConnection}
+            style={{ zIndex: 6000 }} // Увеличиваем z-index для окна бокса
           />
         )}
 
@@ -1933,19 +2168,15 @@ function App() {
         )}
 
         {/* === Область свойств справа === */}
-        {openedBoxId === null && (
+        {openedBoxId === null && activeTab === 'situational' && ( // Добавляем условие activeTab
           <div style={{
-            position: 'absolute',
-            right: 30,
-            top: 140,
-            width: 340,
-            background: '#fff',
-            border: '1px solid #bbb',
-            borderRadius: 8,
-            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+            width: 340, // Задаем фиксированную ширину
+            background: '#f8f8f8', // Фон как у левой панели
+            borderLeft: '1px solid #ddd', // Граница слева
             padding: 18,
-            zIndex: 5000,
-            minHeight: 120
+            overflowY: 'auto', // Скролл, если контент не помещается
+            flexShrink: 0 // Запрещаем панели сжиматься
+            // Удалены: position, right, top, boxShadow, borderRadius, zIndex
           }}>
             {selectedElement === null && (
               <div style={{ color: '#888', fontSize: 15, textAlign: 'center', marginTop: 40 }}>
