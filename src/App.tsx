@@ -44,6 +44,44 @@ const SPLITTER_LOSSES: Record<Splitter['type'], number> = {
   '1x16': 13.9,
 };
 
+// НОВЫЕ КОНСТАНТЫ: Марки кабелей в зависимости от количества волокон
+// ПЕРЕМЕЩЕНО НА ВЕРХНИЙ УРОВЕНЬ ФАЙЛА
+const CABLE_MODELS: Record<number, string[]> = {
+  4: [
+    'ОКТ-Д(1,5)П-4Е1-0,36Ф3,5/0,22Н18-4',
+    'ОКТБг-М(2,7)П-4Е1-0,36Ф3,5/0,22Н18-4',
+    'ОКУ(c1,0)ТГ-нг-04',
+  ],
+  8: [
+    'ОКТ-Д(1,5)П-8Е1-0,36Ф3,5/0,22Н18-8',
+    'ОКТ-Д(2,7)П-8Е1-0,36Ф3,5/0,22Н18-8',
+    'ОКТБг-М(2,7)П-8Е1-0,36Ф3,5/0,22Н18-8',
+    'ОКУ(c1,0)ТГ-нг-08',
+  ],
+  12: [
+    'ОКТ-Д(1,5)П-12Е1-0,36Ф3,5/0,22Н18-12',
+    'ОКТ-Д(2,7)П-12Е1-0,36Ф3,5/0,22Н18-12',
+    'ОКТБг-М(2,7)П-12Е1-0,36Ф3,5/0,22Н18-12',
+    'ОКУ(c1,0)ТГ-нг-12',
+  ],
+  24: [
+    'ОКТ-Д(2,7)П-2*12Е1-0,36Ф3,5/0,22Н18-24',
+    'ОКТБг-М(2,7)П-2*12Е1-0,36Ф3,5/0,22Н18-24',
+    'ОКУ(c1,0)ТГ-нг-24',
+  ],
+  48: [
+    'ОКЛБг-5-ДМ(2,7)2П-4*12Е2D',
+    'ОКЛ-5-Д(1,0)Пнг-HF-4*12E2D',
+  ],
+  96: [
+    'ОКЛБг-5-Д(2,7)2П-8*12Е2D',
+    'ОКЛ-5-Д(1,0)Пнг-HF-8*12E2D',
+  ],
+  144: [
+    'ОКЛБг-5-Д(2,7)2П-12*12Е2D',
+  ],
+};
+
 // Функция для определения количества портов сплиттера
 function getSplitterPortCounts(type: Splitter['type']): { input: number; outputs: number } {
   switch (type) {
@@ -85,7 +123,39 @@ interface Cable {
   targetBoxId: number | null;
   fiberCount: number;
   layingType: 'подвес' | 'канализация';
+  status: 'existing' | 'projected'; // НОВОЕ ПОЛЕ
+  model: string; // НОВОЕ ПОЛЕ: Марка кабеля
+  sewerageWorkDetails?: {
+    reserve: number;
+    sections: number[];
+  };
+  oltTerminalNo?: string; // НОВОЕ ПОЛЕ: Номер терминала OLT для кабеля
+  oltPortNo?: string;     // НОВОЕ ПОЛЕ: Номер порта OLT для кабеля
+  // workType?: 'по мет. конст.' | 'по т/к' | 'в грунте' | 'выход из ЛКС' | 'подвес' | 'по стене' | 'по стояку'; // УДАЛЕНО: старое поле типа работ
+
+  // НОВЫЕ ФАКТИЧЕСКИЕ ПОЛЯ ДЛЯ РАБОТ ПО КАБЕЛЮ (для монтажников, сохраняются)
+  actualCableLength?: number;    // Фактическая длина кабеля
+  actualMarkA?: number;         // Фактическая метка А (изменено на number)
+  actualMarkB?: number;         // Фактическая метка Б (изменено на number)
+
+  actualWorkMetConst?: number; // по мет. конст.
+  actualWorkTK?: number;       // по т/к
+  actualWorkInGround?: number; // в грунте
+  actualWorkExitLKS?: number;  // выход из ЛКС
+  actualWorkSuspension?: number; // подвес
+  actualWorkOnWall?: number;   // по стене
+  actualWorkOnRiser?: number;  // по стояку
 }
+
+// НОВЫЙ ТИП: Для временных проектных расчетов (не сохраняется)
+interface ProjectedWorkDetails {
+  reserve: number;
+  sections: number[];
+  showDetails: boolean; // НОВОЕ: для сворачивания/разворачивания деталей по каждому виду работ
+}
+
+// НОВЫЙ ТИП: Карта временных проектных данных для одного кабеля
+type CableProjectedWork = Record<string, ProjectedWorkDetails>; // Key: work type label, Value: details
 
 // Тип для компонента CableDetailDialog
 interface CableDetailDialogProps {
@@ -1571,11 +1641,18 @@ function App() {
   const [selectedElement, setSelectedElement] = useState<SelectedElement>(null);
   const [openedBoxId, setOpenedBoxId] = useState<number | null>(null);
 
+  // НОВОЕ СОСТОЯНИЕ: для временных проектных расчетов по кабелям
+  const [projectedCableWork, setProjectedCableWork] = useState<Record<number, CableProjectedWork>>({}); // Key: cable ID, Value: Map of work type -> details
+
   const [boxesOpen, setBoxesOpen] = useState(true);
   const [cablesOpen, setCablesOpen] = useState(true);
   const [polesOpen, setPolesOpen] = useState(true);
   const [wellsOpen, setWellsOpen] = useState(true);
   const [splittersOpen, setSplittersOpen] = useState(false); // Изменено с true на false
+  // НОВОЕ СОСТОЯНИЕ: для сворачивания/разворачивания раздела "Работы по кабелю (факт)"
+  const [showActualWorks, setShowActualWorks] = useState(false); // Изменено с true на false
+  // НОВОЕ СОСТОЯНИЕ: для сворачивания/разворачивания раздела "Работы по кабелю (проект)"
+  const [showProjectedWorks, setShowProjectedWorks] = useState(false); // Изменено с true на false
 
   const [isFileMenuOpen, setIsFileMenuOpen] = useState(false);
   const [isPassportsMenuOpen, setIsPassportsMenuOpen] = useState(false);
@@ -1809,14 +1886,36 @@ function App() {
   const handleSaveCableWithParams = () => {
     if (!cableStart || !cableEnd) return;
 
-    const newCable = {
-      id: cables.length + 1, // Просто берем следующий номер после последнего кабеля
+    const newCable: Cable = {
+      id: cables.length + 1,
       points: cablePoints,
       sourceBoxId: cableStart.boxId,
       targetBoxId: cableEnd.boxId,
       fiberCount: newCableParams.fiberCount,
-      layingType: newCableParams.layingType
+      layingType: newCableParams.layingType,
+      status: 'projected' as const,
+      model: CABLE_MODELS[newCableParams.fiberCount]?.[0] || '',
+      oltTerminalNo: '',
+      oltPortNo: '',
+      actualCableLength: 0, // Инициализация
+      actualMarkA: 0,       // Инициализация как число
+      actualMarkB: 0,       // Инициализация как число
+      actualWorkMetConst: 0, // Инициализация
+      actualWorkTK: 0,       // Инициализация
+      actualWorkInGround: 0, // Инициализация
+      actualWorkExitLKS: 0,  // Инициализация
+      actualWorkSuspension: 0, // Инициализация
+      actualWorkOnWall: 0,   // Инициализация
+      actualWorkOnRiser: 0,  // Инициализация
     };
+
+    // Если тип прокладки - канализация, инициализируем sewerageWorkDetails
+    if (newCable.layingType === 'канализация') {
+      newCable.sewerageWorkDetails = {
+        reserve: 0,
+        sections: [0],
+      };
+    }
 
     setCables([...cables, newCable]);
     setShowCableParamsModal(false);
@@ -2244,6 +2343,10 @@ function App() {
       const targetBox = boxes.find(box => box.id === cable.targetBoxId);
       const length = calculateCableLength(cable.points).toFixed(1);
 
+      const totalSewerageLength = cable.sewerageWorkDetails 
+        ? (cable.sewerageWorkDetails.reserve || 0) + cable.sewerageWorkDetails.sections.reduce((sum, val) => sum + val, 0)
+        : 0;
+
       return {
         ID: cable.id,
         'Источник (Бокс ID)': cable.sourceBoxId,
@@ -2252,7 +2355,23 @@ function App() {
         'Назначение (Номер бокса)': targetBox ? targetBox.number : 'Неизвестно',
         Волоконность: cable.fiberCount,
         'Тип прокладки': cable.layingType,
+        'Марка кабеля': cable.model,
+        '№ терминала (OLT)': cable.oltTerminalNo || '',
+        '№ порта (OLT Port)': cable.oltPortNo || '',
         Длина_м: length,
+        'Состояние': cable.status,
+        'Работы_Канализация_Общая_Длина_м': cable.layingType === 'канализация' ? totalSewerageLength.toFixed(2) : '',
+        // НОВЫЕ ФАКТИЧЕСКИЕ ПОЛЯ ДЛЯ ЭКСПОРТА
+        'Длина кабеля (факт)': cable.actualCableLength || 0,
+        'Метка А (факт)': cable.actualMarkA || '',
+        'Метка Б (факт)': cable.actualMarkB || '',
+        'по мет. конст. (факт)': cable.actualWorkMetConst || 0,
+        'по т/к (факт)': cable.actualWorkTK || 0,
+        'в грунте (факт)': cable.actualWorkInGround || 0,
+        'выход из ЛКС (факт)': cable.actualWorkExitLKS || 0,
+        'подвес (факт)': cable.actualWorkSuspension || 0,
+        'по стене (факт)': cable.actualWorkOnWall || 0,
+        'по стояку (факт)': cable.actualWorkOnRiser || 0,
         Количество_точек: cable.points.length,
         Координаты_точек: cable.points.map(pt => `(${pt[0].toFixed(6)}, ${pt[1].toFixed(6)})`).join('; ')
       };
@@ -2402,13 +2521,47 @@ function App() {
               throw new Error('Кабель должен иметь минимум 2 точки');
             }
 
+            // Убеждаемся, что status корректно импортируется
+            const importedStatus: Cable['status'] = 
+              (row.Состояние === 'existing' || row.Состояние === 'projected') 
+                ? row.Состояние 
+                : 'projected'; // Дефолтное значение, если в файле нет или оно некорректно
+
+            // Убеждаемся, что model корректно импортируется
+            const importedModel = row['Марка кабеля'] || (CABLE_MODELS[row.Волоконность]?.[0] || '');
+
+            const importedSewerageWorkDetails = row['Канализация_Запас'] !== undefined || row['Канализация_Участки'] !== undefined 
+              ? {
+                  reserve: typeof row['Канализация_Запас'] === 'number' ? row['Канализация_Запас'] : 0,
+                  sections: typeof row['Канализация_Участки'] === 'string' 
+                    ? row['Канализация_Участки'].split(';').map(s => parseFloat(s.trim())).filter(n => !isNaN(n))
+                    : [],
+                }
+              : undefined;
+
             return {
               id: row.ID || Math.max(...cables.map(c => c.id), 0) + 1,
               sourceBoxId: row['Источник (Бокс ID)'] || null,
               targetBoxId: row['Назначение (Бокс ID)'] || null,
               fiberCount: row.Волоконность || 4,
               layingType: row['Тип прокладки'] || 'подвес',
-              points: points
+              points: points,
+              status: importedStatus,
+              model: importedModel,
+              sewerageWorkDetails: importedSewerageWorkDetails,
+              oltTerminalNo: row['№ терминала (OLT)'] || '',
+              oltPortNo: row['№ порта (OLT Port)'] || '',
+              // НОВЫЕ ФАКТИЧЕСКИЕ ПОЛЯ ДЛЯ ИМПОРТА
+              actualCableLength: parseFloat(row['Длина кабеля (факт)'] || 0),
+              actualMarkA: parseFloat(row['Метка А (факт)'] || 0),  // Парсим в число
+              actualMarkB: parseFloat(row['Метка Б (факт)'] || 0),  // Парсим в число
+              actualWorkMetConst: parseFloat(row['по мет. конст. (факт)'] || 0),
+              actualWorkTK: parseFloat(row['по т/к (факт)'] || 0),
+              actualWorkInGround: parseFloat(row['в грунте (факт)'] || 0),
+              actualWorkExitLKS: parseFloat(row['выход из ЛКС (факт)'] || 0),
+              actualWorkSuspension: parseFloat(row['подвес (факт)'] || 0),
+              actualWorkOnWall: parseFloat(row['по стене (факт)'] || 0),
+              actualWorkOnRiser: parseFloat(row['по стояку (факт)'] || 0),
             };
           });
 
@@ -2444,6 +2597,598 @@ function App() {
       cable.sourceBoxId !== boxId && cable.targetBoxId !== boxId
     );
     setCables(updatedCables);
+  };
+
+  // НОВАЯ ФУНКЦИЯ: для удаления кабеля
+  const handleDeleteCable = (cableId: number) => {
+    // Удаляем кабель из массива кабелей
+    const updatedCables = cables.filter(cable => cable.id !== cableId);
+    setCables(updatedCables);
+    
+    // Если удаленный кабель был выбран, сбрасываем выбор
+    if (selectedElement?.type === 'cable' && selectedElement.id === cableId) {
+      setSelectedElement(null);
+    }
+
+    // Также нужно удалить все внутренние и внешние соединения, связанные с этим кабелем
+    // Удаляем внешние соединения, где участвует этот кабель
+    const updatedFiberConnections = fiberConnections.filter(conn => {
+      // Проверяем, является ли одно из концов соединением с волокном данного кабеля
+      const isEnd1ThisCableFiber = conn.end1.type === 'cableFiber' && parseInt(conn.end1.cableId) === cableId;
+      const isEnd2ThisCableFiber = conn.end2.type === 'cableFiber' && parseInt(conn.end2.cableId) === cableId;
+      return !(isEnd1ThisCableFiber || isEnd2ThisCableFiber);
+    });
+    setFiberConnections(updatedFiberConnections);
+
+    // Удаляем внутренние соединения в боксах, где участвует этот кабель
+    setBoxes(prevBoxes => prevBoxes.map(box => {
+      const updatedInternalConnections = box.internalFiberConnections.filter(internalConn => {
+        const isInternalEnd1ThisCableFiber = internalConn.end1.type === 'cableFiber' && parseInt(internalConn.end1.cableId) === cableId;
+        const isInternalEnd2ThisCableFiber = internalConn.end2.type === 'cableFiber' && parseInt(internalConn.end2.cableId) === cableId;
+        return !(isInternalEnd1ThisCableFiber || isInternalEnd2ThisCableFiber);
+      });
+      // Также очищаем ссылки на удаленный кабель в box.connections
+      const newBoxConnections = { ...box.connections };
+      if (newBoxConnections.input?.cableId === cableId) {
+        newBoxConnections.input = null;
+      }
+      newBoxConnections.outputs = newBoxConnections.outputs.map(output => 
+        output?.cableId === cableId ? null : output
+      );
+
+      return {
+        ...box,
+        internalFiberConnections: updatedInternalConnections,
+        connections: newBoxConnections
+      };
+    }));
+  };
+
+  // НОВЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ для проектных расчетов
+  const WORK_TYPE_LABELS = {
+    'actualWorkMetConst': 'по мет. конст.',
+    'actualWorkTK': 'по т/к',
+    'actualWorkInGround': 'в грунте',
+    'actualWorkExitLKS': 'выход из ЛКС',
+    'actualWorkSuspension': 'подвес',
+    'actualWorkOnWall': 'по стене',
+    'actualWorkOnRiser': 'по стояку',
+  };
+
+  const handleUpdateProjectedReserve = (cableId: number, workTypeLabel: string, value: number) => {
+    setProjectedCableWork(prev => ({
+      ...prev,
+      [cableId]: {
+        ...(prev[cableId] || {}),
+        [workTypeLabel]: {
+          ...(prev[cableId]?.[workTypeLabel] || { reserve: 0, sections: [] }),
+          reserve: value,
+        },
+      },
+    }));
+  };
+
+  const handleAddProjectedSection = (cableId: number, workTypeLabel: string) => {
+    setProjectedCableWork(prev => {
+      const currentCableWorks = prev[cableId] || {};
+      const currentWorkTypeDetails = currentCableWorks[workTypeLabel];
+
+      if (!currentWorkTypeDetails) {
+        // Если нет деталей для этого типа работ, инициализируем их и показываем
+        return {
+          ...prev,
+          [cableId]: {
+            ...currentCableWorks,
+            [workTypeLabel]: { reserve: 0, sections: [], showDetails: true }, // Инициализируем с showDetails: true
+          },
+        };
+      } else {
+        // Если детали уже существуют, добавляем новый участок и убеждаемся, что они показаны
+        return {
+          ...prev,
+          [cableId]: {
+            ...currentCableWorks,
+            [workTypeLabel]: {
+              ...currentWorkTypeDetails,
+              sections: [...currentWorkTypeDetails.sections, 0],
+              showDetails: true, // Убеждаемся, что видимость включена
+            },
+          },
+        };
+      }
+    });
+  };
+
+  const handleUpdateProjectedSection = (cableId: number, workTypeLabel: string, sectionIdx: number, value: number) => {
+    setProjectedCableWork(prev => {
+      const currentWork = prev[cableId]?.[workTypeLabel];
+      if (!currentWork) return prev;
+
+      const newSections = [...currentWork.sections];
+      newSections[sectionIdx] = value;
+      return {
+        ...prev,
+        [cableId]: {
+          ...(prev[cableId] || {}),
+          [workTypeLabel]: {
+            ...currentWork,
+            sections: newSections,
+          },
+        },
+      };
+    });
+  };
+
+  const handleRemoveProjectedSection = (cableId: number, workTypeLabel: string, sectionIdx: number) => {
+    setProjectedCableWork(prev => {
+      const currentWork = prev[cableId]?.[workTypeLabel];
+      if (!currentWork) return prev;
+
+      const newSections = currentWork.sections.filter((_, idx) => idx !== sectionIdx);
+      return {
+        ...prev,
+        [cableId]: {
+          ...(prev[cableId] || {}),
+          [workTypeLabel]: {
+            ...currentWork,
+            sections: newSections,
+          },
+        },
+      };
+    });
+  };
+
+  const calculateProjectedTotal = (cableId: number, workTypeLabel: string) => {
+    const workDetails = projectedCableWork[cableId]?.[workTypeLabel];
+    if (!workDetails) return 0;
+    const totalSectionsSum = workDetails.sections.reduce((sum, val) => sum + val, 0);
+    const baseTotal = workDetails.reserve + totalSectionsSum;
+
+    // НОВАЯ ФОРМУЛА РАСЧЕТА: только для "по т/к"
+    if (workTypeLabel === 'по т/к') {
+      const numberOfSections = workDetails.sections.length; // Количество участков
+      return (baseTotal * 1.057) + numberOfSections;
+    }
+    // НОВАЯ ФОРМУЛА РАСЧЕТА: только для "подвес"
+    if (workTypeLabel === 'подвес') {
+      return baseTotal * 1.027;
+    }
+    return baseTotal; // Для всех остальных типов работ возвращаем просто сумму
+  };
+
+  // НОВАЯ ФУНКЦИЯ: Удалить запас (с возможностью свернуть раздел)
+  const handleRemoveProjectedReserve = (cableId: number, workTypeLabel: string) => {
+    setProjectedCableWork(prev => {
+      const currentCableWorks = { ...(prev[cableId] || {}) };
+      const currentWorkTypeDetails = currentCableWorks[workTypeLabel];
+
+      if (!currentWorkTypeDetails) return prev; 
+
+      // Устанавливаем запас в 0
+      const updatedWorkTypeDetails = { ...currentWorkTypeDetails, reserve: 0, showDetails: currentWorkTypeDetails.showDetails }; // Сохраняем состояние showDetails
+
+      // Если после сброса запаса нет и участков, то удаляем весь тип работ
+      if (updatedWorkTypeDetails.reserve === 0 && updatedWorkTypeDetails.sections.length === 0) {
+        const newCableWorks = { ...currentCableWorks };
+        delete newCableWorks[workTypeLabel]; // Удаляем запись для данного типа работ
+        return {
+          ...prev,
+          [cableId]: newCableWorks,
+        };
+      } else {
+        // Иначе просто обновляем запас
+        return {
+          ...prev,
+          [cableId]: {
+            ...currentCableWorks,
+            [workTypeLabel]: updatedWorkTypeDetails,
+          },
+        };
+      }
+    });
+  };
+
+  // НОВАЯ ФУНКЦИЯ: Переключение видимости деталей для конкретного вида работ
+  const handleToggleProjectedWorkDetails = (cableId: number, workTypeLabel: string) => {
+    setProjectedCableWork(prev => {
+      const currentCableWorks = { ...(prev[cableId] || {}) };
+      const currentWorkTypeDetails = currentCableWorks[workTypeLabel];
+
+      if (!currentWorkTypeDetails) {
+        // Если деталей нет, создаем их и показываем
+        return {
+          ...prev,
+          [cableId]: {
+            ...currentCableWorks,
+            [workTypeLabel]: { reserve: 0, sections: [], showDetails: true },
+          },
+        };
+      } else {
+        // Иначе просто переключаем showDetails
+        return {
+          ...prev,
+          [cableId]: {
+            ...currentCableWorks,
+            [workTypeLabel]: {
+              ...currentWorkTypeDetails,
+              showDetails: !currentWorkTypeDetails.showDetails,
+            },
+          },
+        };
+      }
+    });
+  };
+
+  // НОВАЯ ФУНКЦИЯ: Определяет, какую длину кабеля отображать на карте (приоритет: факт > проект > трасса)
+  const getDisplayCableLength = (cable: Cable): string => {
+    // 1. Проверяем фактическую длину
+    const actualTotalLength = (cable.actualWorkMetConst || 0) +
+                              (cable.actualWorkTK || 0) +
+                              (cable.actualWorkInGround || 0) +
+                              (cable.actualWorkExitLKS || 0) +
+                              (cable.actualWorkSuspension || 0) +
+                              (cable.actualWorkOnWall || 0) +
+                              (cable.actualWorkOnRiser || 0);
+
+    if (actualTotalLength > 0) {
+        return `${Math.ceil(actualTotalLength).toFixed(1)} м`; // Округляем вверх до целого, показываем .0
+    }
+
+    // 2. Если фактической нет, проверяем проектную
+    const projectedOverallTotal = Object.keys(WORK_TYPE_LABELS).reduce((sum, key) => {
+        const label = WORK_TYPE_LABELS[key as keyof typeof WORK_TYPE_LABELS];
+        return sum + calculateProjectedTotal(cable.id, label);
+    }, 0);
+
+    if (projectedOverallTotal > 0) {
+        return `${Math.ceil(projectedOverallTotal).toFixed(1)} м`; // Округляем вверх до целого, показываем .0
+    }
+
+    // 3. Если ни фактической, ни проектной нет, всегда показываем "0.0 м"
+    return `0.0 м`;
+  };
+
+  // НОВЫЕ ИНТЕРФЕЙСЫ ДЛЯ СПЕЦИФИКАЦИИ МАТЕРИАЛОВ
+  interface MaterialItem {
+    id: string;
+    name: string;
+    quantity: number;
+    unit: string;
+  }
+
+  interface MaterialCategory {
+    id: string;
+    name: string;
+    items: MaterialItem[];
+  }
+
+  // ФУНКЦИЯ ДЛЯ ПОДСЧЕТА МАТЕРИАЛОВ (ОБНОВЛЕНО: с группировкой и фильтрацией по статусу)
+  const calculateMaterials = (): MaterialCategory[] => {
+    // Вспомогательная функция для агрегации (группировки) материалов
+    const aggregateItems = (items: MaterialItem[]): MaterialItem[] => {
+      const aggregatedMap = new Map<string, MaterialItem>(); // Key: item.name
+
+      items.forEach(item => {
+        if (aggregatedMap.has(item.name)) {
+          const existingItem = aggregatedMap.get(item.name)!;
+          // Суммируем количество, если единица измерения одинакова
+          if (existingItem.unit === item.unit) {
+            existingItem.quantity += item.quantity;
+          } else {
+            // Если единицы измерения разные, это должно быть обработано отдельно
+            // В данном случае, пока просто добавим как отдельный элемент
+            // Можно добавить логирование или более сложную логику, если нужно.
+            aggregatedMap.set(`${item.name}-${item.id}`, item); // Добавляем с уникальным ID для избежания конфликта ключей
+          }
+        } else {
+          aggregatedMap.set(item.name, { ...item }); // Делаем копию, чтобы не менять исходный объект
+        }
+      });
+      // Преобразуем Map обратно в массив
+      return Array.from(aggregatedMap.values());
+    };
+
+    // Категория "Боксы"
+    const boxItems: MaterialItem[] = boxes
+      .filter(box => box.status !== 'existing') // Исключаем существующие боксы
+      .map(box => ({
+        id: `box-${box.id}`, // Временно, будет заменено после агрегации
+        name: box.model,
+        quantity: 1,
+        unit: 'шт.'
+      }));
+    const boxesCategory: MaterialCategory = {
+      id: 'boxes',
+      name: 'Боксы',
+      items: aggregateItems(boxItems)
+    };
+
+    // Категория "Сплиттеры"
+    const splitterItems: MaterialItem[] = boxes
+      .filter(box => box.status !== 'existing') // Исключаем сплиттеры из существующих боксов
+      .flatMap(box =>
+        box.splitters.map(splitter => ({
+          id: `splitter-${splitter.id}`, // Временно
+          name: `Сплиттер ${splitter.type} ${splitter.connectorType || 'без коннектора'}`,
+          quantity: 1,
+          unit: 'шт.'
+        }))
+      );
+    const splittersCategory: MaterialCategory = {
+      id: 'splitters',
+      name: 'Сплиттеры',
+      items: aggregateItems(splitterItems)
+    };
+
+    // Категория "Кабели"
+    const cableItems: MaterialItem[] = cables
+      .filter(cable => cable.status !== 'existing') // Исключаем существующие кабели
+      .map(cable => ({
+        id: `cable-${cable.id}`, // Временно
+        name: `${cable.model} ${cable.fiberCount} волокон`,
+        quantity: calculateProjectedTotal(cable.id, 'по мет. конст.') + // Добавляем все проектные работы
+                  calculateProjectedTotal(cable.id, 'по т/к') +
+                  calculateProjectedTotal(cable.id, 'в грунте') +
+                  calculateProjectedTotal(cable.id, 'выход из ЛКС') +
+                  calculateProjectedTotal(cable.id, 'подвес') +
+                  calculateProjectedTotal(cable.id, 'по стене') +
+                  calculateProjectedTotal(cable.id, 'по стояку'),
+        unit: 'м'
+      }));
+    const cablesCategory: MaterialCategory = {
+      id: 'cables',
+      name: 'Кабели',
+      // Для кабелей, вместо quantity: 1, мы используем суммарную проектную длину
+      // и агрегируем их по названию, чтобы получить общую длину для каждой марки
+      items: aggregateItems(cableItems)
+    };
+
+    return [boxesCategory, splittersCategory, cablesCategory];
+  };
+
+  // КОМПОНЕНТ ДЛЯ ОТОБРАЖЕНИЯ СПЕЦИФИКАЦИИ
+  const MaterialsSpecification = () => {
+    const materials = calculateMaterials();
+
+    return (
+      <div style={{ padding: '20px', overflowY: 'auto', flex: 1 }}> {/* Добавляем overflowY и flex: 1 */}
+        <h2 style={{ marginBottom: '20px' }}>Спецификация материалов</h2>
+        
+        {materials.map(category => (
+          <div key={category.id} style={{ marginBottom: '30px' }}>
+            <h3 style={{ 
+              backgroundColor: '#094961', 
+              color: 'white', 
+              padding: '10px',
+              marginBottom: '15px',
+              borderRadius: '4px'
+            }}>
+              {category.name}
+            </h3>
+            
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ backgroundColor: '#f5f5f5' }}>
+                  <th style={{ padding: '10px', textAlign: 'left', borderBottom: '2px solid #ddd' }}>Наименование</th>
+                  <th style={{ padding: '10px', textAlign: 'right', borderBottom: '2px solid #ddd', width: '100px' }}>Количество</th>
+                  <th style={{ padding: '10px', textAlign: 'left', borderBottom: '2px solid #ddd', width: '80px' }}>Ед. изм.</th>
+                </tr>
+              </thead>
+              <tbody>
+                {category.items.map(item => (
+                  <tr key={item.id} style={{ borderBottom: '1px solid #eee' }}>
+                    <td style={{ padding: '10px' }}>{item.name}</td>
+                    <td style={{ padding: '10px', textAlign: 'right' }}>{item.unit === 'м' ? item.quantity.toFixed(2) : item.quantity}</td>{/* Форматируем метры */}
+                    <td style={{ padding: '10px' }}>{item.unit}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  // НОВЫЕ ИНТЕРФЕЙСЫ ДЛЯ СПЕЦИФИКАЦИИ РАБОТ
+  interface WorkItem {
+    id: string;
+    name: string;
+    quantity: number;
+    unit: string;
+  }
+
+  interface WorkCategory {
+    id: string;
+    name: string;
+    items: WorkItem[];
+  }
+
+  // ФУНКЦИЯ ДЛЯ ПОДСЧЕТА РАБОТ
+  const calculateWorks = (): WorkCategory[] => {
+    const categories: WorkCategory[] = [];
+
+    // Вспомогательная функция для агрегации (группировки) элементов работ
+    const aggregateWorkItems = (items: WorkItem[]): WorkItem[] => {
+      const aggregatedMap = new Map<string, WorkItem>();
+
+      items.forEach(item => {
+        if (aggregatedMap.has(item.name)) {
+          const existingItem = aggregatedMap.get(item.name)!;
+          if (existingItem.unit === item.unit) {
+            existingItem.quantity += item.quantity;
+          } else {
+            // Если единицы измерения разные, добавляем как отдельный элемент
+            // Или если название уже уникальное (как для агрегированных кабельных работ), просто добавляем.
+            aggregatedMap.set(`${item.name}-${item.id}`, item);
+          }
+        } else {
+          aggregatedMap.set(item.name, { ...item }); // Делаем копию, чтобы не менять исходный объект
+        }
+      });
+      return Array.from(aggregatedMap.values());
+    };
+
+    // 1. Работы по боксам
+    const projectedBoxes = boxes.filter(box => box.status === 'projected');
+    const boxWorks: WorkItem[] = [
+      {
+        id: 'box-installation',
+        name: 'Установка бокса',
+        quantity: projectedBoxes.length,
+        unit: 'шт.'
+      }
+    ];
+    categories.push({ id: 'box-works', name: 'Работы по боксам', items: aggregateWorkItems(boxWorks) });
+
+    // 2. Работы по сплиттерам
+    // ИЗМЕНЕНИЕ: Убираем фильтрацию по статусу бокса, чтобы считать ВСЕ сплиттеры
+    const allSplitters = boxes.flatMap(box => box.splitters);
+
+    const splittersWithoutConnector: Record<Splitter['type'], number> = {
+      '1x2': 0, '1x4': 0, '1x8': 0, '1x16': 0
+    };
+    let totalSplittersWithConnector = 0;
+
+    allSplitters.forEach(splitter => { // Используем allSplitters
+      if (splitter.connectorType === null) {
+        // Сплиттеры без коннектора, подсчитываем по каждому типу
+        splittersWithoutConnector[splitter.type] += 1;
+      } else {
+        // Сплиттеры с коннектором, считаем общее количество
+        totalSplittersWithConnector += 1;
+      }
+    });
+
+    const splitterWorksItems: WorkItem[] = [];
+    Object.entries(splittersWithoutConnector).forEach(([type, count]) => {
+      if (count > 0) {
+        splitterWorksItems.push({
+          id: `splitter-no-conn-${type}`,
+          name: `Монтаж сплиттера ${type} (без коннектора)`,
+          quantity: count,
+          unit: 'шт.'
+        });
+      }
+    });
+    if (totalSplittersWithConnector > 0) {
+      splitterWorksItems.push({
+        id: 'splitter-with-conn-total',
+        name: 'Монтаж сплиттера (с коннектором)',
+        quantity: totalSplittersWithConnector,
+        unit: 'шт.'
+      });
+    }
+    categories.push({ id: 'splitter-works', name: 'Работы по сплиттерам', items: aggregateWorkItems(splitterWorksItems) });
+
+    // 3. Работы по кабелю (ОБНОВЛЕНО: детализация по видам работ и приоритет факт/проект)
+    const projectedCables = cables.filter(cable => cable.status === 'projected');
+
+    // Карта для хранения суммарных длин по марке кабеля и типу работы
+    const cableModelWorkBreakdown = new Map<string, Record<string, number>>(); // Map<model, Map<workTypeLabel, totalLength>>
+
+    projectedCables.forEach(cable => {
+      const model = cable.model;
+      if (!cableModelWorkBreakdown.has(model)) {
+        cableModelWorkBreakdown.set(model, {});
+      }
+      const modelBreakdown = cableModelWorkBreakdown.get(model)!;
+
+      Object.keys(WORK_TYPE_LABELS).forEach(key => {
+        const label = WORK_TYPE_LABELS[key as keyof typeof WORK_TYPE_LABELS];
+        
+        let workLengthForType = 0;
+
+        // Приоритет: фактическая длина для данного типа работы, если есть и больше 0
+        const actualWorkKey = key as keyof Cable; // Например: 'actualWorkMetConst'
+        if (typeof cable[actualWorkKey] === 'number' && (cable[actualWorkKey] as number) > 0) {
+          workLengthForType = cable[actualWorkKey] as number;
+        } else {
+          // Иначе используем проектную длину (которая включает специфичные множители)
+          workLengthForType = calculateProjectedTotal(cable.id, label);
+        }
+
+        if (workLengthForType > 0) {
+          modelBreakdown[label] = (modelBreakdown[label] || 0) + workLengthForType;
+        }
+      });
+    });
+
+    const cableWorksItems: WorkItem[] = [];
+    cableModelWorkBreakdown.forEach((breakdown, model) => {
+      let totalLengthForModel = 0;
+      const breakdownParts: string[] = [];
+
+      Object.entries(breakdown)
+        .filter(([, quantity]) => quantity > 0) // Фильтруем нулевые значения
+        .forEach(([workType, quantity]) => {
+          totalLengthForModel += quantity;
+          breakdownParts.push(`${workType}: ${quantity.toFixed(1)} м`);
+        });
+
+      const name = `Прокладка кабеля (${model}), общая длина: ${totalLengthForModel.toFixed(1)} м` +
+                   (breakdownParts.length > 0 ? ` (из них: ${breakdownParts.join(', ')})` : '');
+      
+      if (totalLengthForModel > 0) { // Добавляем только если есть общая длина
+        cableWorksItems.push({
+          id: `cable-work-summary-${model}`, // Уникальный ID для агрегированной строки
+          name: name,
+          quantity: totalLengthForModel, // Общее количество для этой строки
+          unit: 'м'
+        });
+      }
+    });
+
+    // Применяем aggregateWorkItems, хотя для детальных кабельных работ это может не изменить список,
+    // так как 'name' уже будет уникальным для каждой модели с её разбивкой.
+    categories.push({ id: 'cable-works', name: 'Работы по кабелю', items: aggregateWorkItems(cableWorksItems) });
+
+    return categories;
+  };
+
+  // КОМПОНЕНТ ДЛЯ ОТОБРАЖЕНИЯ СПЕЦИФИКАЦИИ РАБОТ
+  const WorksSpecification = () => {
+    const works = calculateWorks();
+
+    return (
+      <div style={{ padding: '20px', overflowY: 'auto', flex: 1 }}> {/* Добавляем overflowY и flex: 1 */}
+        <h2 style={{ marginBottom: '20px' }}>Спецификация работ</h2>
+        
+        {works.map(category => (
+          <div key={category.id} style={{ marginBottom: '30px' }}>
+            <h3 style={{ 
+              backgroundColor: '#094961', 
+              color: 'white', 
+              padding: '10px',
+              marginBottom: '15px',
+              borderRadius: '4px'
+            }}>
+              {category.name}
+            </h3>
+            
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ backgroundColor: '#f5f5f5' }}>
+                  <th style={{ padding: '10px', textAlign: 'left', borderBottom: '2px solid #ddd' }}>Наименование работы</th>
+                  <th style={{ padding: '10px', textAlign: 'right', borderBottom: '2px solid #ddd', width: '120px' }}>Количество</th>
+                  <th style={{ padding: '10px', textAlign: 'left', borderBottom: '2px solid #ddd', width: '80px' }}>Ед. изм.</th>
+                </tr>
+              </thead>
+              <tbody>
+                {category.items.map(item => (
+                  <tr key={item.id} style={{ borderBottom: '1px solid #eee' }}>
+                    <td style={{ padding: '10px' }}>{item.name}</td>
+                    {/* Форматируем метры до одного знака после запятой, остальные числа без десятичных */}
+                    <td style={{ padding: '10px', textAlign: 'right' }}>{item.unit === 'м' ? item.quantity.toFixed(1) : item.quantity}</td>
+                    <td style={{ padding: '10px' }}>{item.unit}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+      </div>
+    );
   };
 
   return (
@@ -3004,7 +3749,7 @@ function App() {
                                 interactive={false}
                               >
                                 <span style={{ fontSize: 13, fontWeight: 600 }}>
-                                  {calculateCableLength(cable.points).toFixed(1)} м
+                                  {getDisplayCableLength(cable)} {/* ИСПОЛЬЗУЕМ НОВУЮ ФУНКЦИЮ */}
                                 </span>
                               </Tooltip>
                             )}
@@ -3179,17 +3924,11 @@ function App() {
         )}
 
         {activeTab === 'materials' && (
-          <div style={{ padding: 20 }}>
-            <h2>Спецификация материалов</h2>
-            <p>Здесь будет отображаться спецификация материалов.</p>
-          </div>
+          <MaterialsSpecification />
         )}
 
         {activeTab === 'works' && (
-          <div style={{ padding: 20 }}>
-            <h2>Спецификация работ</h2>
-            <p>Здесь будет отображаться спецификация работ.</p>
-          </div>
+          <WorksSpecification />
         )}
 
         {/* Диалог с деталями бокса */}
@@ -3290,12 +4029,12 @@ function App() {
                         <option value="projected">Проектируемый</option>
                         <option value="existing">Существующий</option>
                       </select>
-                    </div>
+                  </div>
                     <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
                       <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Номер бокса:</label>
                       <input value={box.number} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, number: e.target.value } : b))} style={{ flexGrow: 1 }} />
-                    </div>
-                    {/* НОВОЕ ПОЛЕ: Модель бокса */}
+                  </div>
+                  {/* НОВОЕ ПОЛЕ: Модель бокса */}
                     <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
                       <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Модель бокса:</label>
                       <select
@@ -3313,45 +4052,45 @@ function App() {
                         <option value="FOB-05-24-24SC">FOB-05-24-24SC</option>
                         <option value="FOB-05-24">FOB-05-24</option>
                       </select>
-                    </div>
-                    {/* НОВЫЕ ПОЛЯ: № терминала (OLT) и № порта (OLT Port) */}
+                  </div>
+                  {/* НОВЫЕ ПОЛЯ: № терминала (OLT) и № порта (OLT Port) */}
                     <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
                       <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>№ терминала (OLT):</label>
                       <input value={box.oltTerminalNo} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, oltTerminalNo: e.target.value } : b))} style={{ flexGrow: 1 }} />
-                    </div>
+                  </div>
                     <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
                       <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>№ порта (OLT Port):</label>
                       <input value={box.oltPortNo} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, oltPortNo: e.target.value } : b))} style={{ flexGrow: 1 }} />
-                    </div>
+                  </div>
                     <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
                       <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Адрес:</label>
                       <input value={box.address} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, address: e.target.value } : b))} style={{ flexGrow: 1 }} />
-                    </div>
+                  </div>
                     <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
                       <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Место установки:</label>
                       <input value={box.place} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, place: e.target.value } : b))} style={{ flexGrow: 1 }} />
-                    </div>
-                    {/* РАЗДЕЛЕННЫЕ ПОЛЯ: Координаты */}
+                  </div>
+                  {/* РАЗДЕЛЕННЫЕ ПОЛЯ: Координаты */}
                     <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
                       <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Широта:</label>
                       <input value={box.position[0].toFixed(6)} readOnly style={{ flexGrow: 1, color: '#888' }} />
-                    </div>
+                  </div>
                     <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
                       <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Долгота:</label>
                       <input value={box.position[1].toFixed(6)} readOnly style={{ flexGrow: 1, color: '#888' }} />
-                    </div>
+                  </div>
 
-                    {/* НОВАЯ СЕКЦИЯ: Список сплиттеров в боксе */}
-                    {box.splitters.length > 0 && (
-                      <div style={{ marginTop: 20, borderTop: '1px dashed #eee', paddingTop: 15 }}>
-                        <h4 style={{ marginTop: 0, marginBottom: 10 }}>Установленные сплиттеры:</h4>
-                        {box.splitters.map((splitter, idx) => (
-                          <div key={splitter.id} style={{ marginBottom: 8, fontSize: '13px', lineHeight: '1.4' }}>
+                  {/* НОВАЯ СЕКЦИЯ: Список сплиттеров в боксе */}
+                  {box.splitters.length > 0 && (
+                    <div style={{ marginTop: 20, borderTop: '1px dashed #eee', paddingTop: 15 }}>
+                      <h4 style={{ marginTop: 0, marginBottom: 10 }}>Установленные сплиттеры:</h4>
+                      {box.splitters.map((splitter, idx) => (
+                        <div key={splitter.id} style={{ marginBottom: 8, fontSize: '13px', lineHeight: '1.4' }}>
                             <strong>Сплиттер {idx + 1}:</strong> Уровень {splitter.level}, Номер: {splitter.number || 'не задан'}, {splitter.connectorType || 'Без коннектора'}
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   </div>
                   {/* НОВАЯ КНОПКА: Удалить бокс */}
                   <button
@@ -3377,51 +4116,413 @@ function App() {
               if (!cable) return null;
               return (
                 <>
-                  <h3 style={{ marginTop: 0 }}>Свойства кабеля</h3>
-                  <div style={{ marginBottom: 10 }}>
-                    <label>Волоконность:<br />
+                  <div style={{ marginBottom: 15 }}>
+                    <h3 style={{ margin: '0 0 10px 0', textAlign: 'center' }}>Свойства кабеля</h3>
+                    
+                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                      <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Состояние:</label>
+                      <select
+                        value={cable.status}
+                        onChange={e => setCables(cables => cables.map(c => 
+                          c.id === cable.id ? { ...c, status: e.target.value as Cable['status'] } : c
+                        ))}
+                        style={{ flexGrow: 1 }}
+                      >
+                        <option value="projected">Проектируемый</option>
+                        <option value="existing">Существующий</option>
+                      </select>
+                    </div>
+
+                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                      <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Количество волокон:</label>
                       <select
                         value={cable.fiberCount}
                         onChange={e => {
-                          const newFiberCount = Number(e.target.value);
+                          const newFiberCount = parseInt(e.target.value);
+                          const defaultModel = CABLE_MODELS[newFiberCount]?.[0] || '';
                           setCables(cables => cables.map(c =>
-                            c.id === cable.id ? { ...c, fiberCount: newFiberCount } : c
+                            c.id === cable.id ? { ...c, fiberCount: newFiberCount, model: defaultModel } : c
                           ));
                         }}
-                        style={{ width: '100%' }}
+                        style={{ flexGrow: 1 }}
                       >
-                        <option value={4}>4</option>
-                        <option value={8}>8</option>
-                        <option value={12}>12</option>
-                        <option value={24}>24</option>
-                        <option value={48}>48</option>
-                        <option value={96}>96</option>
-                        <option value={144}>144</option>
+                        <option value="4">4</option>
+                        <option value="8">8</option>
+                        <option value="12">12</option>
+                        <option value="24">24</option>
+                        <option value="48">48</option>
+                        <option value="96">96</option>
+                        <option value="144">144</option>
                       </select>
-                    </label>
                   </div>
-                  <div style={{ marginBottom: 10 }}>
-                    <label>Тип прокладки:<br />
+
+                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                      <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Марка кабеля:</label>
+                      <select
+                        value={cable.model || ''}
+                        onChange={e => setCables(cables => cables.map(c => 
+                          c.id === cable.id ? { ...c, model: e.target.value } : c
+                        ))}
+                        style={{ flexGrow: 1 }}
+                      >
+                        <option value="">Выберите марку</option>
+                        {CABLE_MODELS[cable.fiberCount]?.map(model => (
+                          <option key={model} value={model}>{model}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                      <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Тип прокладки:</label>
                       <select
                         value={cable.layingType}
-                        onChange={e => {
-                          const newLayingType = e.target.value as Cable['layingType'];
-                          setCables(cables => cables.map(c =>
-                            c.id === cable.id ? { ...c, layingType: newLayingType } : c
-                          ));
-                        }}
-                        style={{ width: '100%' }}
+                        onChange={e => setCables(cables => cables.map(c => 
+                          c.id === cable.id ? { ...c, layingType: e.target.value as Cable['layingType'] } : c
+                        ))}
+                        style={{ flexGrow: 1 }}
                       >
                         <option value="подвес">Подвес</option>
                         <option value="канализация">Канализация</option>
                       </select>
-                    </label>
                   </div>
-                  <div style={{ marginBottom: 10 }}>
-                    <label>Длина:<br />
-                      <input value={`${calculateCableLength(cable.points).toFixed(1)} м`} readOnly style={{ width: '100%', color: '#888' }} />
-                    </label>
+
+                    {/* НОВОЕ ПОЛЕ: № терминала (OLT) */}
+                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                      <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>№ терминала (OLT):</label>
+                      <input
+                        type="text"
+                        value={cable.oltTerminalNo || ''}
+                        onChange={e => setCables(cables => cables.map(c => 
+                          c.id === cable.id ? { ...c, oltTerminalNo: e.target.value } : c
+                        ))}
+                        style={{ flexGrow: 1 }}
+                      />
                   </div>
+
+                    {/* НОВОЕ ПОЛЕ: № порта (OLT Port) */}
+                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                      <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>№ порта (OLT Port):</label>
+                      <input
+                        type="text"
+                        value={cable.oltPortNo || ''}
+                        onChange={e => setCables(cables => cables.map(c => 
+                          c.id === cable.id ? { ...c, oltPortNo: e.target.value } : c
+                        ))}
+                        style={{ flexGrow: 1 }}
+                      />
+                    </div>
+
+                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                      <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Длина трассы:</label>
+                      <input 
+                        value={`${calculateCableLength(cable.points).toFixed(2)} м`}
+                        readOnly
+                        style={{ flexGrow: 1, color: '#888' }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* НОВЫЙ РАЗДЕЛ: Работы по кабелю (проектные расчеты) */}
+                  <div style={{
+                    marginTop: 20,
+                    borderTop: '1px dashed #eee',
+                    paddingTop: 15,
+                    marginBottom: 15
+                  }}>
+                    {/* ОБНОВЛЕННЫЙ БЛОК: Заголовок для списка проектных работ и кнопка сворачивания */}
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      marginBottom: '10px',
+                      justifyContent: 'center',
+                    }}>
+                      <h4
+                        style={{
+                          margin: '0',
+                          cursor: 'pointer',
+                          width: '100%',
+                        }}
+                        onClick={() => setShowProjectedWorks(!showProjectedWorks)} // Добавляем обработчик клика
+                      >
+                        Работы по кабелю (проект) {showProjectedWorks ? '▼' : '►'} {/* Индикатор */}
+                      </h4>
+                    </div>
+
+                    {/* Условное отображение полей проектных работ */}
+                    {showProjectedWorks && (
+                      <>
+                        {/* НОВОЕ ПОЛЕ: Длина (проект) - вычисляемое */}
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Длина (проект):</label>
+                          <input
+                            type="text"
+                            value={`${Object.keys(WORK_TYPE_LABELS).reduce((sum, key) => {
+                                const label = WORK_TYPE_LABELS[key as keyof typeof WORK_TYPE_LABELS];
+                                return sum + calculateProjectedTotal(cable.id, label);
+                            }, 0).toFixed(2)} м`}
+                            readOnly
+                            style={{ flexGrow: 1, color: '#888', fontWeight: 'bold' }}
+                          />
+                        </div>
+
+                        {Object.keys(WORK_TYPE_LABELS).map((key) => {
+                          const label = WORK_TYPE_LABELS[key as keyof typeof WORK_TYPE_LABELS];
+                          const currentProjectedWork = projectedCableWork[cable.id]?.[label];
+                          const totalProjected = currentProjectedWork ? calculateProjectedTotal(cable.id, label) : null;
+
+                          return (
+                            <div key={key} style={{ marginBottom: 15, border: '1px solid #eee', padding: 10, borderRadius: 5 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 5 }}>
+                                <label
+                                  style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px', cursor: 'pointer' }}
+                                  onClick={() => handleToggleProjectedWorkDetails(cable.id, label)}
+                                >
+                                  {label}: {currentProjectedWork?.showDetails ? '▼' : '►'}
+                                </label>
+                                <input
+                                  type="text"
+                                  value={totalProjected !== null ? totalProjected.toFixed(2) + ' м' : '0.00 м'}
+                                  readOnly
+                                  style={{ flexGrow: 1, color: '#888', fontWeight: 'bold' }}
+                                />
+                                <button
+                                  onClick={() => handleAddProjectedSection(cable.id, label)}
+                                  style={{ marginLeft: '10px', padding: '5px 8px', cursor: 'pointer', minWidth: '30px' }}
+                                >
+                                  +
+                                </button>
+                              </div>
+
+                              {currentProjectedWork && currentProjectedWork.showDetails && (
+                                <>
+                                  <div style={{ display: 'flex', alignItems: 'center', marginBottom: 5, marginLeft: '10px' }}>
+                                    <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Запас:</label>
+                                    <input
+                                      type="number"
+                                      value={currentProjectedWork.reserve}
+                                      onChange={e => handleUpdateProjectedReserve(cable.id, label, parseFloat(e.target.value) || 0)}
+                                      style={{ flexGrow: 1 }}
+                                    />
+                                    <button
+                                      onClick={() => handleRemoveProjectedReserve(cable.id, label)}
+                                      style={{ marginLeft: '10px', padding: '5px 8px', cursor: 'pointer', background: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', minWidth: '30px' }}
+                                    >
+                                      -
+                                    </button>
+                                  </div>
+
+                                  {currentProjectedWork.sections.map((sectionVal, idx) => (
+                                    <div key={idx} style={{ display: 'flex', alignItems: 'center', marginBottom: 5, marginLeft: '10px' }}>
+                                      <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Участок {idx + 1}:</label>
+                                      <input
+                                        type="number"
+                                        value={sectionVal}
+                                        onChange={e => handleUpdateProjectedSection(cable.id, label, idx, parseFloat(e.target.value) || 0)}
+                                        style={{ flexGrow: 1 }}
+                                      />
+                                      <button
+                                        onClick={() => handleRemoveProjectedSection(cable.id, label, idx)}
+                                        style={{ marginLeft: '10px', padding: '5px 8px', cursor: 'pointer', background: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', minWidth: '30px' }}
+                                      >
+                                        -
+                                      </button>
+                                    </div>
+                                  ))}
+
+                                  <div style={{ display: 'flex', alignItems: 'center', marginBottom: 5, marginLeft: '10px' }}>
+                                      <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Добавить участок:</label>
+                                      <button
+                                          onClick={() => handleAddProjectedSection(cable.id, label)}
+                                          style={{ marginLeft: '10px', padding: '5px 8px', cursor: 'pointer', minWidth: '30px' }}
+                                      >
+                                          +
+                                      </button>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </>
+                    )}
+                  </div>
+
+                  {/* НОВЫЙ РАЗДЕЛ: Работы по кабелю */}
+                  <div style={{
+                    marginTop: 20,
+                    borderTop: '1px dashed #eee',
+                    paddingTop: 15,
+                    marginBottom: 15 // Добавляем отступ снизу для секции
+                  }}>
+                    {/* ОБНОВЛЕННЫЙ БЛОК: Заголовок для списка фактических работ и кнопка сворачивания */}
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      marginBottom: '10px', // Немного уменьшил отступ
+                      justifyContent: 'center', // Центрируем содержимое заголовка
+                    }}>
+                      <h4 
+                        style={{ 
+                          margin: '0', 
+                          cursor: 'pointer', 
+                          width: '100%', // Убедимся, что h4 занимает всю ширину для кликабельности
+                        }} 
+                        onClick={() => setShowActualWorks(!showActualWorks)}
+                      >
+                        Работы по кабелю (факт) {showActualWorks ? '▼' : '►'}
+                      </h4>
+                    </div>
+                    
+                    {/* Условное отображение полей фактических работ */}
+                    {showActualWorks && (
+                      <>
+                        {/* ФАКТИЧЕСКОЕ ПОЛЕ: Длина кабеля (теперь вычисляемое) */}
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Длина (факт):</label>
+                          <input
+                            type="text" // Изменено на text, так как это теперь отображаемое поле с " м"
+                            value={`${((cable.actualWorkMetConst || 0) +
+                                      (cable.actualWorkTK || 0) +
+                                      (cable.actualWorkInGround || 0) +
+                                      (cable.actualWorkExitLKS || 0) +
+                                      (cable.actualWorkSuspension || 0) +
+                                      (cable.actualWorkOnWall || 0) +
+                                      (cable.actualWorkOnRiser || 0)).toFixed(2)} м`}
+                            readOnly // Теперь только для чтения
+                            style={{ flexGrow: 1, color: '#888', fontWeight: 'bold' }} // Добавим bold, чтобы подчеркнуть, что это итоговое значение
+                          />
+                        </div>
+
+                        {/* ФАКТИЧЕСКОЕ ПОЛЕ: Метка А */}
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Метка А:</label>
+                          <input
+                            type="number" // Изменено на number
+                            value={cable.actualMarkA || 0} // Убедитесь, что значение по умолчанию 0, если undefined
+                            onChange={e => setCables(cables => cables.map(c => 
+                              c.id === cable.id ? { ...c, actualMarkA: parseFloat(e.target.value) || 0 } : c
+                            ))}
+                            style={{ flexGrow: 1 }}
+                          />
+                        </div>
+
+                        {/* ФАКТИЧЕСКОЕ ПОЛЕ: Метка Б */}
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Метка Б:</label>
+                          <input
+                            type="number" // Изменено на number
+                            value={cable.actualMarkB || 0} // Убедитесь, что значение по умолчанию 0, если undefined
+                            onChange={e => setCables(cables => cables.map(c => 
+                              c.id === cable.id ? { ...c, actualMarkB: parseFloat(e.target.value) || 0 } : c
+                            ))}
+                            style={{ flexGrow: 1 }}
+                          />
+                        </div>
+
+                        {/* НОВЫЕ ФАКТИЧЕСКИЕ ПОЛЯ ДЛЯ ВИДОВ РАБОТ */}
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>по мет. конст.:</label>
+                          <input
+                            type="number"
+                            value={cable.actualWorkMetConst || 0}
+                            onChange={e => setCables(cables => cables.map(c => 
+                              c.id === cable.id ? { ...c, actualWorkMetConst: parseFloat(e.target.value) || 0 } : c
+                            ))}
+                            style={{ flexGrow: 1 }}
+                          />
+                        </div>
+
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>по т/к:</label>
+                          <input
+                            type="number"
+                            value={cable.actualWorkTK || 0}
+                            onChange={e => setCables(cables => cables.map(c => 
+                              c.id === cable.id ? { ...c, actualWorkTK: parseFloat(e.target.value) || 0 } : c
+                            ))}
+                            style={{ flexGrow: 1 }}
+                          />
+                        </div>
+
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>в грунте:</label>
+                          <input
+                            type="number"
+                            value={cable.actualWorkInGround || 0}
+                            onChange={e => setCables(cables => cables.map(c => 
+                              c.id === cable.id ? { ...c, actualWorkInGround: parseFloat(e.target.value) || 0 } : c
+                            ))}
+                            style={{ flexGrow: 1 }}
+                          />
+                        </div>
+
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>выход из ЛКС:</label>
+                          <input
+                            type="number"
+                            value={cable.actualWorkExitLKS || 0}
+                            onChange={e => setCables(cables => cables.map(c => 
+                              c.id === cable.id ? { ...c, actualWorkExitLKS: parseFloat(e.target.value) || 0 } : c
+                            ))}
+                            style={{ flexGrow: 1 }}
+                          />
+                        </div>
+
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>подвес:</label>
+                          <input
+                            type="number"
+                            value={cable.actualWorkSuspension || 0}
+                            onChange={e => setCables(cables => cables.map(c => 
+                              c.id === cable.id ? { ...c, actualWorkSuspension: parseFloat(e.target.value) || 0 } : c
+                            ))}
+                            style={{ flexGrow: 1 }}
+                          />
+                        </div>
+
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>по стене:</label>
+                          <input
+                            type="number"
+                            value={cable.actualWorkOnWall || 0}
+                            onChange={e => setCables(cables => cables.map(c => 
+                              c.id === cable.id ? { ...c, actualWorkOnWall: parseFloat(e.target.value) || 0 } : c
+                            ))}
+                            style={{ flexGrow: 1 }}
+                          />
+                        </div>
+
+                        <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                          <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>по стояку:</label>
+                          <input
+                            type="number"
+                            value={cable.actualWorkOnRiser || 0}
+                            onChange={e => setCables(cables => cables.map(c => 
+                              c.id === cable.id ? { ...c, actualWorkOnRiser: parseFloat(e.target.value) || 0 } : c
+                            ))}
+                            style={{ flexGrow: 1 }}
+                          />
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Кнопка "Удалить кабель" */}
+                  <button
+                    onClick={() => handleDeleteCable(cable.id)}
+                    style={{
+                      background: '#dc3545',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '4px',
+                      padding: '8px 16px',
+                      cursor: 'pointer',
+                      marginTop: '20px',
+                      width: '100%'
+                    }}
+                  >
+                    Удалить кабель
+                  </button>
                 </>
               );
             })()}
