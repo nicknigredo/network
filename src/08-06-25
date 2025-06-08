@@ -20,7 +20,7 @@ interface FiberStructure {
 interface Splitter {
   id: string; // Уникальный ID для сплиттера внутри бокса (например, 'splitter-1-level1', 'splitter-2-level2-a')
   type: '1x2' | '1x4' | '1x8' | '1x16'; // Тип сплиттера
-  connectorType: 'SC/UPC' | 'SC/APC' | null; // НОВОЕ ПОЛЕ: null означает отсутствие коннектора
+  hasConnector: boolean; // Наличие коннектора (true/false)
   level: 1 | 2 | 3; // Уровень сплиттера: 1-й, 2-й, 3-й
   number: string; // НОВОЕ ПОЛЕ: номер сплиттера для отображения (вручную)
 }
@@ -512,8 +512,8 @@ function CableDetailDialog({
   const handleAddSplitter = (level: Splitter['level']) => {
     const newSplitter: Splitter = {
       id: `splitter-${Date.now()}`,
-      type: '1x8', // По умолчанию 1x8, можно изменить
-      connectorType: 'SC/UPC', // Устанавливаем SC/UPC по умолчанию
+      type: '1x8',
+      hasConnector: true,
       level: level,
       number: '', // Инициализируем пустым значением для ручного ввода
     };
@@ -526,9 +526,8 @@ function CableDetailDialog({
     const updatedSplitters = splitters.filter(s => s.id !== splitterId);
     // Также нужно удалить все внутренние соединения, связанные с этим сплиттером
     const updatedInternalConnections = internalConnections.filter(conn => {
-      // Используем type guards для безопасного доступа к свойствам splitterId
-      const isEnd1SplitterPort = (conn.end1.type === 'splitterPort' && conn.end1.splitterId === splitterId);
-      const isEnd2SplitterPort = (conn.end2.type === 'splitterPort' && conn.end2.splitterId === splitterId);
+      const isEnd1SplitterPort = conn.end1.type === 'splitterPort' && conn.end1.splitterId === splitterId;
+      const isEnd2SplitterPort = conn.end2.type === 'splitterPort' && conn.end2.splitterId === splitterId;
       return !(isEnd1SplitterPort || isEnd2SplitterPort);
     });
 
@@ -546,23 +545,6 @@ function CableDetailDialog({
     onUpdateBoxSplitters(box.id, updatedSplitters);
   };
 
-  // НОВАЯ ФУНКЦИЯ: для изменения типа сплиттера
-  const handleUpdateSplitterType = (splitterId: string, newType: Splitter['type']) => {
-    const updatedSplitters = splitters.map(s =>
-      s.id === splitterId ? { ...s, type: newType } : s
-    );
-    setSplitters(updatedSplitters);
-    onUpdateBoxSplitters(box.id, updatedSplitters);
-  };
-
-  // НОВАЯ ФУНКЦИЯ: для изменения типа коннектора сплиттера
-  const handleUpdateSplitterConnectorType = (splitterId: string, newType: Splitter['connectorType']) => {
-    const updatedSplitters = splitters.map(s =>
-      s.id === splitterId ? { ...s, connectorType: newType } : s
-    );
-    setSplitters(updatedSplitters);
-    onUpdateBoxSplitters(box.id, updatedSplitters);
-  };
 
   // --- Конец функций для управления сплиттерами ---
 
@@ -628,11 +610,6 @@ function CableDetailDialog({
 
       return report;
   };
-
-  // НОВАЯ ФУНКЦИЯ: для расчета общего затухания сплиттера
-  function getSplitterTotalAttenuation(splitter: Splitter): number {
-    return SPLITTER_LOSSES[splitter.type]; // Возвращаем только затухание сплиттера
-  }
 
   return (
     <div style={{
@@ -739,30 +716,7 @@ function CableDetailDialog({
                   borderBottom: '1px dashed #eee',
                 }}>
                   <span>
-                    Уровень: {splitter.level} |
-                    {/* НОВОЕ: Выпадающий список для выбора типа сплиттера */}
-                    Тип:
-                    <select
-                      value={splitter.type}
-                      onChange={(e) => handleUpdateSplitterType(splitter.id, e.target.value as Splitter['type'])}
-                      style={{ marginLeft: '5px', width: '80px', padding: '2px' }}
-                    >
-                      <option value="1x2">1x2</option>
-                      <option value="1x4">1x4</option>
-                      <option value="1x8">1x8</option>
-                      <option value="1x16">1x16</option>
-                    </select>
-                    {/* НОВОЕ: Выпадающий список для выбора типа коннектора */}
-                    | Коннектор:
-                    <select
-                      value={splitter.connectorType || 'null'} // Используем 'null' как строковое значение для отсутствия коннектора
-                      onChange={(e) => handleUpdateSplitterConnectorType(splitter.id, e.target.value === 'null' ? null : e.target.value as Splitter['connectorType'])}
-                      style={{ marginLeft: '5px', width: '100px', padding: '2px' }}
-                    >
-                      <option value="null">Без коннектора</option>
-                      <option value="SC/UPC">SC/UPC</option>
-                      <option value="SC/APC">SC/APC</option>
-                    </select>
+                    Уровень: {splitter.level} | Тип: {splitter.type} | Коннектор: {splitter.hasConnector ? 'Да' : 'Нет'}
                     <br/>
                     Номер:
                     <input
@@ -771,10 +725,6 @@ function CableDetailDialog({
                       onChange={(e) => handleUpdateSplitterNumber(splitter.id, e.target.value)}
                       style={{ marginLeft: '5px', width: '80px', padding: '2px' }} // Уменьшил padding
                     />
-                    {/* НОВОЕ: Отображение затухания сплиттера */}
-                    <span style={{ marginLeft: '10px', fontSize: '12px', fontWeight: 'bold' }}>
-                      Затухание: {getSplitterTotalAttenuation(splitter).toFixed(1)} дБ
-                    </span>
                   </span>
                   <button onClick={() => handleDeleteSplitter(splitter.id)} style={{ marginLeft: '10px', background: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', padding: '4px 8px', cursor: 'pointer' }}>Удалить</button> {/* Уменьшил padding и margin */}
                 </div>
@@ -2430,22 +2380,6 @@ function App() {
 
   const boxIdToUpdateInternalConnections = useRef<number | null>(null);
 
-  // НОВАЯ ФУНКЦИЯ: для удаления бокса
-  const handleDeleteBox = (boxId: number) => {
-    // Удаляем бокс из массива боксов
-    const updatedBoxes = boxes.filter(box => box.id !== boxId);
-    setBoxes(updatedBoxes);
-    
-    // Закрываем окно деталей бокса
-    setSelectedElement(null);
-    
-    // Удаляем все кабели, связанные с этим боксом
-    const updatedCables = cables.filter(cable => 
-      cable.sourceBoxId !== boxId && cable.targetBoxId !== boxId
-    );
-    setCables(updatedCables);
-  };
-
   return (
     <div style={{
       display: 'flex',
@@ -3276,32 +3210,32 @@ function App() {
               if (!box) return null;
               return (
                 <>
-                  <div style={{ marginBottom: 15 }}>
-                    <h3 style={{ margin: '0 0 10px 0', textAlign: 'center' }}>Свойства бокса</h3>
-                    {/* Обновленный стиль для каждого поля */}
-                    {/* Применяем flexbox для каждой строки свойств */}
-                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
-                      <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Состояние:</label>
+                  <h3 style={{ marginTop: 0 }}>Свойства бокса</h3>
+                  {/* НОВОЕ ПОЛЕ: Состояние */}
+                  <div style={{ marginBottom: 10 }}>
+                    <label>Состояние:<br />
                       <select
                         value={box.status}
                         onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, status: e.target.value as Box['status'] } : b))}
-                        style={{ flexGrow: 1 }}
+                        style={{ width: '100%' }}
                       >
                         <option value="projected">Проектируемый</option>
                         <option value="existing">Существующий</option>
                       </select>
-                    </div>
-                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
-                      <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Номер бокса:</label>
-                      <input value={box.number} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, number: e.target.value } : b))} style={{ flexGrow: 1 }} />
-                    </div>
-                    {/* НОВОЕ ПОЛЕ: Модель бокса */}
-                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
-                      <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Модель бокса:</label>
+                    </label>
+                  </div>
+                  <div style={{ marginBottom: 10 }}>
+                    <label>Номер бокса:<br />
+                      <input value={box.number} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, number: e.target.value } : b))} style={{ width: '100%' }} />
+                    </label>
+                  </div>
+                  {/* НОВОЕ ПОЛЕ: Модель бокса */}
+                  <div style={{ marginBottom: 10 }}>
+                    <label>Модель бокса:<br />
                       <select
                         value={box.model}
                         onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, model: e.target.value as Box['model'] } : b))}
-                        style={{ flexGrow: 1 }}
+                        style={{ width: '100%' }}
                       >
                         <option value="FOB-02-04-04LC">FOB-02-04-04LC</option>
                         <option value="FOB-03-12-08LC">FOB-03-12-08LC</option>
@@ -3313,62 +3247,52 @@ function App() {
                         <option value="FOB-05-24-24SC">FOB-05-24-24SC</option>
                         <option value="FOB-05-24">FOB-05-24</option>
                       </select>
-                    </div>
-                    {/* НОВЫЕ ПОЛЯ: № терминала (OLT) и № порта (OLT Port) */}
-                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
-                      <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>№ терминала (OLT):</label>
-                      <input value={box.oltTerminalNo} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, oltTerminalNo: e.target.value } : b))} style={{ flexGrow: 1 }} />
-                    </div>
-                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
-                      <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>№ порта (OLT Port):</label>
-                      <input value={box.oltPortNo} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, oltPortNo: e.target.value } : b))} style={{ flexGrow: 1 }} />
-                    </div>
-                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
-                      <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Адрес:</label>
-                      <input value={box.address} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, address: e.target.value } : b))} style={{ flexGrow: 1 }} />
-                    </div>
-                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
-                      <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Место установки:</label>
-                      <input value={box.place} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, place: e.target.value } : b))} style={{ flexGrow: 1 }} />
-                    </div>
-                    {/* РАЗДЕЛЕННЫЕ ПОЛЯ: Координаты */}
-                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
-                      <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Широта:</label>
-                      <input value={box.position[0].toFixed(6)} readOnly style={{ flexGrow: 1, color: '#888' }} />
-                    </div>
-                    <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
-                      <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Долгота:</label>
-                      <input value={box.position[1].toFixed(6)} readOnly style={{ flexGrow: 1, color: '#888' }} />
-                    </div>
-
-                    {/* НОВАЯ СЕКЦИЯ: Список сплиттеров в боксе */}
-                    {box.splitters.length > 0 && (
-                      <div style={{ marginTop: 20, borderTop: '1px dashed #eee', paddingTop: 15 }}>
-                        <h4 style={{ marginTop: 0, marginBottom: 10 }}>Установленные сплиттеры:</h4>
-                        {box.splitters.map((splitter, idx) => (
-                          <div key={splitter.id} style={{ marginBottom: 8, fontSize: '13px', lineHeight: '1.4' }}>
-                            <strong>Сплиттер {idx + 1}:</strong> Уровень {splitter.level}, Номер: {splitter.number || 'не задан'}, {splitter.connectorType || 'Без коннектора'}
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                    </label>
                   </div>
-                  {/* НОВАЯ КНОПКА: Удалить бокс */}
-                  <button
-                    onClick={() => handleDeleteBox(box.id)}
-                    style={{
-                      background: '#dc3545',
-                      color: 'white',
-                      border: 'none',
-                      borderRadius: '4px',
-                      padding: '8px 16px',
-                      cursor: 'pointer',
-                      marginTop: '20px', // Добавляем отступ сверху
-                      width: '100%'
-                    }}
-                  >
-                    Удалить бокс
-                  </button>
+                  {/* НОВЫЕ ПОЛЯ: № терминала (OLT) и № порта (OLT Port) */}
+                  <div style={{ marginBottom: 10 }}>
+                    <label>№ терминала (OLT):<br />
+                      <input value={box.oltTerminalNo} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, oltTerminalNo: e.target.value } : b))} style={{ width: '100%' }} />
+                    </label>
+                  </div>
+                  <div style={{ marginBottom: 10 }}>
+                    <label>№ порта (OLT Port):<br />
+                      <input value={box.oltPortNo} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, oltPortNo: e.target.value } : b))} style={{ width: '100%' }} />
+                    </label>
+                  </div>
+                  <div style={{ marginBottom: 10 }}>
+                    <label>Адрес:<br />
+                      <input value={box.address} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, address: e.target.value } : b))} style={{ width: '100%' }} />
+                    </label>
+                  </div>
+                  <div style={{ marginBottom: 10 }}>
+                    <label>Место установки:<br />
+                      <input value={box.place} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, place: e.target.value } : b))} style={{ width: '100%' }} />
+                    </label>
+                  </div>
+                  {/* РАЗДЕЛЕННЫЕ ПОЛЯ: Координаты */}
+                  <div style={{ marginBottom: 10 }}>
+                    <label>Широта:<br />
+                      <input value={box.position[0].toFixed(6)} readOnly style={{ width: '100%', color: '#888' }} />
+                    </label>
+                  </div>
+                  <div style={{ marginBottom: 10 }}>
+                    <label>Долгота:<br />
+                      <input value={box.position[1].toFixed(6)} readOnly style={{ width: '100%', color: '#888' }} />
+                    </label>
+                  </div>
+
+                  {/* НОВАЯ СЕКЦИЯ: Список сплиттеров в боксе */}
+                  {box.splitters.length > 0 && (
+                    <div style={{ marginTop: 20, borderTop: '1px dashed #eee', paddingTop: 15 }}>
+                      <h4 style={{ marginTop: 0, marginBottom: 10 }}>Установленные сплиттеры:</h4>
+                      {box.splitters.map((splitter, idx) => (
+                        <div key={splitter.id} style={{ marginBottom: 8, fontSize: '13px', lineHeight: '1.4' }}>
+                          <strong>Сплиттер {idx + 1}:</strong> Уровень {splitter.level}, Номер: {splitter.number || 'не задан'}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </>
               );
             })()}
