@@ -1,0 +1,4112 @@
+import React from 'react';
+import { MapContainer, TileLayer, Marker, ScaleControl, useMapEvents, Popup, Tooltip, Polyline, LayerGroup, LayersControl, ZoomControl } from 'react-leaflet';
+import 'leaflet/dist/leaflet.css';
+import L, { DivIcon, DragEndEvent, LatLngExpression } from 'leaflet';
+import { useRef, useEffect, useState } from 'react';
+import JSZip from 'jszip';
+import * as XLSX from 'xlsx';
+import { saveAs } from 'file-saver';
+import Toolbar from './components/Toolbar';
+import Tabs from './components/Tabs';
+
+// Импорты из вынесенных файлов
+import {
+  FiberStructure,
+  Splitter,
+  ConnectionPoint,
+  InternalConnection,
+  Box,
+  SpliceClosure,
+  Cable,
+  ProjectedWorkDetails,
+  CableProjectedWork,
+  CableDetailDialogProps,
+  OdesaColor,
+  Pole,
+  Well,
+  SelectedElement,
+  CableEndpoint,
+  MaterialItem,
+  MaterialCategory,
+  WorkItem,
+  WorkCategory
+} from './types';
+
+import {
+  SPLITTER_LOSSES,
+  CABLE_MODELS,
+  ODESA_COLORS,
+  WORK_TYPE_LABELS
+} from './constants';
+
+import {
+  getSplitterPortCounts,
+  calculateCableLength,
+  getPolylineMiddlePoint,
+  getCableStructure,
+  getBoxCenter,
+  isConnectionPointBusyGlobal,
+  isSplitterPort,
+  isCableFiber,
+  validateBoxConnections,
+  getSplitterTotalAttenuation
+} from './utils';
+
+import { getBoxIcon, getCablePointIcon, getWellIcon, getPoleIcon, getSpliceClosureIcon } from './utils/icons'; 
+function CableDetailDialog({
+  box,
+  onClose,
+  cables,
+  boxes,
+  fiberConnections: globalExternalConnections, // Переименовано для ясности
+  selectedConnectionPoint,
+  onConnectionPointClick,
+  onRemoveFiberConnection,
+  style,
+  onUpdateBoxSplitters,
+  onUpdateBoxInternalConnections,
+}: CableDetailDialogProps) {
+  // НОВОЕ СОСТОЯНИЕ: для показа модального окна отчета по соединениям
+  // ПЕРЕМЕЩЕНО ВВЕРХ, ЧТОБЫ ИЗБЕЖАТЬ ОШИБКИ REACT HOOKS
+  const [showConnectionsReport, setShowConnectionsReport] = useState(false);
+  // НОВОЕ СОСТОЯНИЕ: для сворачивания/разворачивания списка сплиттеров
+  const [showSplitterList, setShowSplitterList] = useState(true); // Можно установить false по умолчанию, если хотите, чтобы он был свернут
+
+  const [maxHeight, setMaxHeight] = useState(600);
+  const [rowHeight] = useState(24);
+  const minSplitterHeight = 40; // <-- ОПРЕДЕЛЯЕМ ЗДЕСЬ
+  const [totalWidth] = useState(900);
+  const [cableSpacing] = useState(40);
+  const [svgInternalPadding] = useState(50); // Отступ внутри SVG от верхнего края, это будет базовый Y для начала контента
+
+  // Состояние для внутренних соединений и сплиттеров в текущем боксе
+  const [splitters, setSplitters] = useState<Splitter[]>(box?.splitters || []);
+  const [internalConnections, setInternalConnections] = useState<InternalConnection[]>(box?.internalFiberConnections || []);
+
+  useEffect(() => {
+    // Обновляем состояния при изменении пропса box
+    setSplitters(box?.splitters || []);
+    setInternalConnections(box?.internalFiberConnections || []);
+  }, [box]);
+  
+  const incomingCable = cables.find(c => c.targetElement?.type === 'box' && c.targetElement.id === box?.id);
+  const outgoingCables = cables.filter(c => c.sourceElement.type === 'box' && c.sourceElement.id === box?.id);
+
+  // --- Расчеты Y-координат для элементов внутри SVG ---
+  const contentBaseY = svgInternalPadding; // Базовая Y-координата для начала основного контента SVG
+
+  // Позиции для входящего кабеля (левая колонка)
+  const incomingCableHeaderY = contentBaseY;
+  const incomingCableFibersHeight = incomingCable
+    ? getCableStructure(incomingCable.fiberCount).length * rowHeight 
+    : 0;
+  const incomingCableFibersY = incomingCableHeaderY + 35; // Волокна начинаются на 35px ниже заголовка
+
+  // Позиции для секции сплиттеров (под входящим кабелем)
+  const splitterSectionY = incomingCableFibersY + incomingCableFibersHeight + (incomingCableFibersHeight > 0 ? 30 : 0); // Отступ 30px после волокон входящего кабеля
+  
+  // Расчет общей высоты для сплиттеров динамически (ПЕРЕМЕЩЕНО СЮДА)
+  const totalSplittersSvgHeight = splitters.reduce((acc, splitter) => {
+    const { input: inputPortsCount, outputs: outputPortsCount } = getSplitterPortCounts(splitter.type);
+    const totalPorts = inputPortsCount + outputPortsCount;
+    const individualSplitterCalculatedHeight = Math.max(minSplitterHeight, totalPorts * rowHeight + 20); 
+    return acc + individualSplitterCalculatedHeight + 20; // +20px отступ между сплиттерами
+  }, 0);
+
+  // Позиции для исходящих кабелей (правая колонка)
+  const outgoingCablesStartRelativeYPositions: number[] = [];
+  let currentOutgoingRelativeY = 0;
+  outgoingCables.forEach((cable) => {
+    outgoingCablesStartRelativeYPositions.push(currentOutgoingRelativeY);
+    const cableFibersHeight = getCableStructure(cable.fiberCount).length * rowHeight;
+    currentOutgoingRelativeY += (cableFibersHeight + 35) + cableSpacing;
+  });
+  const totalOutgoingCablesVisualHeight = currentOutgoingRelativeY;
+
+  // Расчет общей высоты SVG
+  const leftColumnEnd = splitterSectionY + totalSplittersSvgHeight;
+  const rightColumnEnd = contentBaseY + totalOutgoingCablesVisualHeight;
+
+  const svgCalculatedHeight = Math.max(leftColumnEnd, rightColumnEnd) + svgInternalPadding;
+
+  // --- НОВОЕ: Предварительный расчет координат всех портов сплиттеров ---
+  // Этот Map будет хранить абсолютные {x, y} координаты для каждого порта сплиттера
+  const splitterPortCoordinates = new Map<string, { x: number; y: number }>();
+  let currentSplitterAbsoluteY = splitterSectionY; // Абсолютная Y-позиция для текущего сплиттера
+
+  splitters.forEach(splitter => {
+    const portsAlignmentX = 300; // X-координата портов относительно `g` для сплиттеров
+    const absolutePortsX = 20 + portsAlignmentX; // Абсолютная X-координата портов в SVG (20px - смещение группы сплиттеров)
+
+    const { input: inputPortsCount, outputs: outputPortsCount } = getSplitterPortCounts(splitter.type);
+    const totalPorts = inputPortsCount + outputPortsCount;
+    const calculatedSplitterHeight = Math.max(minSplitterHeight, totalPorts * rowHeight + 20);
+    const portSpacing = calculatedSplitterHeight / (totalPorts + 1);
+
+    let currentPortYOffset = portSpacing; // Y-смещение порта относительно начала СВОЕГО сплиттера
+
+    // Сохраняем координаты входных портов
+    for (let idx = 0; idx < inputPortsCount; idx++) {
+      const point: ConnectionPoint = { type: 'splitterPort', splitterId: splitter.id, portType: 'input', portIdx: idx };
+      splitterPortCoordinates.set(JSON.stringify(point), { 
+        x: absolutePortsX, 
+        y: currentSplitterAbsoluteY + currentPortYOffset // Абсолютная Y-координата
+      });
+      currentPortYOffset += portSpacing;
+    }
+
+    // Сохраняем координаты выходных портов
+    for (let idx = 0; idx < outputPortsCount; idx++) {
+      const point: ConnectionPoint = { type: 'splitterPort', splitterId: splitter.id, portType: 'output', portIdx: idx };
+      splitterPortCoordinates.set(JSON.stringify(point), { 
+        x: absolutePortsX, 
+        y: currentSplitterAbsoluteY + currentPortYOffset 
+      });
+      currentPortYOffset += portSpacing;
+    }
+
+    currentSplitterAbsoluteY += calculatedSplitterHeight + 20; // Увеличиваем Y для следующего сплиттера (высота + отступ)
+  });
+
+  useEffect(() => {
+    const updateHeight = () => {
+      setMaxHeight(window.innerHeight * 0.8);
+    };
+    updateHeight();
+    window.addEventListener('resize', updateHeight);
+    return () => window.removeEventListener('resize', updateHeight);
+  }, []);
+
+  if (!box) return null;
+
+  const renderCell = (
+    text: string,
+    background: string,
+    width: number,
+    x: number,
+    y: number,
+    border?: string
+  ) => (
+    <g transform={`translate(${x}, ${y})`}>
+      <rect
+        width={width}
+        height={rowHeight}
+        fill={background}
+        stroke={border || "none"}
+        strokeWidth={border ? 1 : 0}
+      />
+      <text
+        x={width / 2}
+        y={rowHeight / 2}
+        dominantBaseline="middle"
+        textAnchor="middle"
+        fill={background === '#ffffff' ? '#000' : '#fff'}
+        style={{ fontSize: '12px' }}
+      >
+        {text}
+      </text>
+    </g>
+  );
+
+  const renderCableInfo = (cable: Cable, side: 'left' | 'right', y: number) => {
+    const fromBox = boxes.find(b => b.id === cable.sourceElement.id);
+    const toBox = boxes.find(b => b.id === cable.targetElement?.id);
+    const length = calculateCableLength(cable.points).toFixed(1);
+
+    // Удален неиспользуемый блок isFiberBusy, который вызывал ошибки типизации
+
+    return (
+      <g transform={`translate(${side === 'left' ? 20 : totalWidth - 380}, ${y})`}>
+        <rect
+          width={280}
+          height={24}
+          fill="#f0f0f0"
+          stroke="#ccc"
+          strokeWidth={1}
+        />
+        <text
+          x={10}
+          y={17}
+          fill="#000"
+          style={{ fontSize: '12px' }}
+        >
+          Кабель #{cable.id} • {cable.fiberCount}вол. • {length}м •
+          {side === 'left' ?
+            `От ${fromBox?.number || '?'}` :
+            `До ${toBox?.number || '?'}`}
+        </text>
+      </g>
+    );
+  };
+
+  // НОВАЯ / ОБНОВЛЕННАЯ ФУНКЦИЯ ПРОВЕРКИ ЗАНЯТОСТИ ТОЧКИ СОЕДИНЕНИЯ
+  const isConnectionPointBusy = (point: ConnectionPoint) => {
+    // Проверяем ЗАНЯТОСТЬ в рамках внутренних соединений текущего бокса
+    const isBusyInternally = internalConnections.some(conn => {
+      const checkEnd = (end: ConnectionPoint) => {
+        if (point.type === 'cableFiber' && end.type === 'cableFiber') {
+          return end.cableId === point.cableId && end.fiberIdx === point.fiberIdx;
+        }
+        if (point.type === 'splitterPort' && end.type === 'splitterPort') {
+          return end.splitterId === point.splitterId &&
+                 end.portType === point.portType &&
+                 end.portIdx === point.portIdx;
+        }
+        return false;
+      };
+      return checkEnd(conn.end1) || checkEnd(conn.end2);
+    });
+
+    // Дополнительно проверяем, занято ли волокно кабеля внешними соединениями
+    const isBusyExternally = globalExternalConnections.some(conn => {
+      // Проверяем только если текущая 'point' - это волокно кабеля
+      if (point.type === 'cableFiber') {
+        const checkExternalEnd = (end: ConnectionPoint) => {
+          if (end.type === 'cableFiber') {
+            // Проверяем, участвует ли данное соединение в текущем входящем/исходящем кабеле бокса
+            return (end.cableId === point.cableId && end.fiberIdx === point.fiberIdx);
+          }
+          return false; // Порты сплиттеров не могут быть заняты внешними соединениями
+        };
+        return checkExternalEnd(conn.end1) || checkExternalEnd(conn.end2);
+      }
+      return false; // Порты сплиттеров не могут быть заняты внешними соединениями
+    });
+
+    return isBusyInternally || isBusyExternally;
+  };
+
+  // НОВАЯ ФУНКЦИЯ: для отрисовки сплиттера в SVG
+  const renderSplitterSvg = (splitter: Splitter, y: number) => {
+    const splitterBodyWidth = 80; // Ширина прямоугольного тела сплиттера
+    // X-координата, на которой будут выровнены все порты сплиттера
+    // (относительно начального смещения группы сплиттеров в 20px)
+    const portsAlignmentX = 300; // 320 (абсолютная X для волокон кабеля) - 20 (смещение группы) = 300
+    // X-координата начала прямоугольника сплиттера
+    const splitterRectX = portsAlignmentX - splitterBodyWidth;
+
+    const { input: inputPortsCount, outputs: outputPortsCount } = getSplitterPortCounts(splitter.type);
+    const totalPorts = inputPortsCount + outputPortsCount;
+
+    // Расчет высоты сплиттера, чтобы вместить все порты + отступы
+    const calculatedSplitterHeight = Math.max(minSplitterHeight, totalPorts * rowHeight + 20); 
+
+    // Определяем цвет фона в зависимости от уровня сплиттера (существующая логика)
+    let backgroundColor = '#e0e0e0'; 
+    if (splitter.level === 1) {
+      backgroundColor = '#FFDDDD'; // Светло-красный для 1-го уровня
+    } else if (splitter.level === 2) {
+      backgroundColor = '#DDFFDD'; // Светло-зеленый для 2-го уровня
+    } else if (splitter.level === 3) {
+      backgroundColor = '#DDDDFF'; // Светло-синий для 3-го уровня
+    }
+
+    // Расчет равномерного вертикального интервала между портами
+    const portSpacing = calculatedSplitterHeight / (totalPorts + 1);
+    let currentPortYOffset = portSpacing; // Начальная Y-координата для первого порта
+
+    return (
+      <g transform={`translate(0, ${y})`}> {/* Это 'g' уже смещено на 20px по X в App.tsx */}
+        {/* Фоновый прямоугольник сплиттера */}
+        <rect
+          x={splitterRectX} y="0"
+          width={splitterBodyWidth}
+          height={calculatedSplitterHeight}
+          fill={backgroundColor}
+          stroke="#999"
+          strokeWidth="1"
+          rx="5" ry="5"
+        />
+
+        {/* Вертикальный текст с номером сплиттера */}
+        <text
+          x={splitterRectX + 10} // Смещение от левого края прямоугольника (10px отступ)
+          y={calculatedSplitterHeight / 2} // Центр по высоте
+          textAnchor="start" // Текст будет начинаться от этой точки
+          dominantBaseline="middle" // Центрируем по вертикали относительно Y
+          fontSize="13" 
+          fontWeight="bold"
+          fill="#333"
+          // Поворот вокруг своей точки (x, y), чтобы текст начинался от смещенной X-позиции
+          transform={`rotate(-90 ${splitterRectX + 10} ${calculatedSplitterHeight / 2})`}
+        >
+          {splitter.number || `ID: ${splitter.id.substring(splitter.id.lastIndexOf('-') + 1)}`}
+        </text>
+
+        {/* Входной порт */}
+        {Array.from({ length: inputPortsCount }).map((_, idx) => {
+          const point: ConnectionPoint = {
+            type: 'splitterPort',
+            splitterId: splitter.id,
+            portType: 'input',
+            portIdx: idx,
+          };
+          const isSelected = selectedConnectionPoint?.type === point.type &&
+                             selectedConnectionPoint.splitterId === point.splitterId &&
+                             selectedConnectionPoint.portType === point.portType &&
+                             selectedConnectionPoint.portIdx === point.portIdx;
+          const busy = isConnectionPointBusy(point);
+          const portColor = isSelected ? 'gold' : busy ? 'gray' : '#0070c0';
+          const cursor = busy ? 'not-allowed' : 'pointer';
+
+          // Текущая Y-координата для этого порта
+          const currentPortY = currentPortYOffset;
+          currentPortYOffset += portSpacing; // Увеличиваем смещение для следующего порта
+
+          return (
+            <g key={`in-port-${idx}`} transform={`translate(${portsAlignmentX}, ${currentPortY})`}>
+              <circle
+                cx="0" cy="0" r="6" fill={portColor} stroke="black" strokeWidth="1"
+                style={{ cursor: cursor }}
+                onClick={() => !busy && onConnectionPointClick(point)}
+              >
+                 <title>{`Входной порт ${idx + 1}`}</title>
+              </circle>
+              {/* Метка порта */}
+              <text x="-15" y="0" textAnchor="end" dominantBaseline="middle" fontSize="12" fill="#333">
+                IN
+              </text>
+            </g>
+          );
+        })}
+
+        {/* Выходные порты */}
+        {Array.from({ length: outputPortsCount }).map((_, idx) => {
+          const point: ConnectionPoint = {
+            type: 'splitterPort',
+            splitterId: splitter.id,
+            portType: 'output',
+            portIdx: idx,
+          };
+          const isSelected = selectedConnectionPoint?.type === point.type &&
+                             selectedConnectionPoint.splitterId === point.splitterId &&
+                             selectedConnectionPoint.portType === point.portType &&
+                             selectedConnectionPoint.portIdx === point.portIdx;
+          const busy = isConnectionPointBusy(point);
+          const portColor = isSelected ? 'gold' : busy ? 'gray' : '#0070c0';
+          const cursor = busy ? 'not-allowed' : 'pointer';
+
+          // Текущая Y-координата для этого порта
+          const currentPortY = currentPortYOffset;
+          currentPortYOffset += portSpacing; // Увеличиваем смещение для следующего порта
+
+          return (
+            <g key={`out-port-${idx}`} transform={`translate(${portsAlignmentX}, ${currentPortY})`}>
+              <circle
+                cx="0" cy="0" r="6" fill={portColor} stroke="black" strokeWidth="1"
+                style={{ cursor: cursor }}
+                onClick={() => !busy && onConnectionPointClick(point)}
+              >
+                 <title>{`Выходной порт ${idx + 1}`}</title>
+              </circle>
+              {/* Метка порта */}
+              <text x="-15" y="0" textAnchor="end" dominantBaseline="middle" fontSize="12" fill="#333">
+                OUT{idx + 1}
+              </text>
+            </g>
+          );
+        })}
+      </g>
+    );
+  };
+
+  // --- Функции для управления сплиттерами ---
+  const handleAddSplitter = (level: Splitter['level']) => {
+    const newSplitter: Splitter = {
+      id: `splitter-${Date.now()}`,
+      type: '1x8', // По умолчанию 1x8, можно изменить
+      connectorType: 'SC/UPC', // Устанавливаем SC/UPC по умолчанию
+      level: level,
+      number: '', // Инициализируем пустым значением для ручного ввода
+    };
+    const updatedSplitters = [...splitters, newSplitter];
+    setSplitters(updatedSplitters);
+    onUpdateBoxSplitters(box.id, updatedSplitters);
+  };
+
+  const handleDeleteSplitter = (splitterId: string) => {
+    const updatedSplitters = splitters.filter(s => s.id !== splitterId);
+    // Также нужно удалить все внутренние соединения, связанные с этим сплиттером
+    const updatedInternalConnections = internalConnections.filter(conn => {
+      // Используем type guards для безопасного доступа к свойствам splitterId
+      const isEnd1SplitterPort = (conn.end1.type === 'splitterPort' && conn.end1.splitterId === splitterId);
+      const isEnd2SplitterPort = (conn.end2.type === 'splitterPort' && conn.end2.splitterId === splitterId);
+      return !(isEnd1SplitterPort || isEnd2SplitterPort);
+    });
+
+    setSplitters(updatedSplitters);
+    setInternalConnections(updatedInternalConnections); // Обновляем внутренние соединения
+    onUpdateBoxSplitters(box.id, updatedSplitters);
+    onUpdateBoxInternalConnections(box.id, updatedInternalConnections); // Обновляем состояние в App.tsx
+  };
+
+  const handleUpdateSplitterNumber = (splitterId: string, newNumber: string) => {
+    const updatedSplitters = splitters.map(s =>
+      s.id === splitterId ? { ...s, number: newNumber } : s
+    );
+    setSplitters(updatedSplitters);
+    onUpdateBoxSplitters(box.id, updatedSplitters);
+  };
+
+  // НОВАЯ ФУНКЦИЯ: для изменения типа сплиттера
+  const handleUpdateSplitterType = (splitterId: string, newType: Splitter['type']) => {
+    const updatedSplitters = splitters.map(s =>
+      s.id === splitterId ? { ...s, type: newType } : s
+    );
+    setSplitters(updatedSplitters);
+    onUpdateBoxSplitters(box.id, updatedSplitters);
+  };
+
+  // НОВАЯ ФУНКЦИЯ: для изменения типа коннектора сплиттера
+  const handleUpdateSplitterConnectorType = (splitterId: string, newType: Splitter['connectorType']) => {
+    const updatedSplitters = splitters.map(s =>
+      s.id === splitterId ? { ...s, connectorType: newType } : s
+    );
+    setSplitters(updatedSplitters);
+    onUpdateBoxSplitters(box.id, updatedSplitters);
+  };
+
+  // --- Конец функций для управления сплиттерами ---
+
+  // НОВОЕ СОСТОЯНИЕ: для показа модального окна отчета по соединениям
+  // Эта строка дублируется и должна быть удалена
+  
+  // НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: для форматирования точки соединения в читаемую строку
+  const formatConnectionPoint = (point: ConnectionPoint, currentBoxId: number) => {
+      if (isCableFiber(point)) { // Используем type guard
+          const cable = cables.find(c => String(c.id) === point.cableId);
+          const cableNumber = cable ? `Кабель #${cable.id}` : `Неизвестный кабель #${point.cableId}`;
+          return `${cableNumber} волокно #${point.fiberIdx + 1} (${point.direction === 'in' ? 'вход' : 'выход'})`;
+      } else if (isSplitterPort(point)) { // Используем type guard
+          const splitter = splitters.find(s => s.id === point.splitterId);
+          const splitterName = splitter ? (splitter.number || `Сплиттер ID:${point.splitterId.substring(point.splitterId.lastIndexOf('-') + 1)}`) : `Неизвестный сплиттер ID:${point.splitterId.substring(point.splitterId.lastIndexOf('-') + 1)}`;
+          return `${splitterName} ${point.portType === 'input' ? 'входной' : 'выходной'} порт #${point.portIdx + 1}`;
+      }
+      return 'Неизвестная точка'; // На всякий случай
+  };
+
+  // НОВАЯ ФУНКЦИЯ: для генерации отчета по соединениям
+  const generateConnectionReport = () => {
+      const report: string[] = [];
+
+      // 1. Внутренние соединения для текущего бокса
+      report.push('--- ВНУТРЕННИЕ СОЕДИНЕНИЯ ---');
+      if (internalConnections.length === 0) {
+          report.push('Нет внутренних соединений.');
+      } else {
+          internalConnections.forEach((conn, i) => {
+              const end1Str = formatConnectionPoint(conn.end1, box.id);
+              const end2Str = formatConnectionPoint(conn.end2, box.id);
+              report.push(`${i + 1}. ${end1Str} <---> ${end2Str}`);
+          });
+      }
+
+      // 2. Внешние соединения, имеющие отношение к этому боксу (входящие/исходящие кабели)
+      report.push('\n--- ВНЕШНИЕ СОЕДИНЕНИЯ (С УЧАСТИЕМ КАБЕЛЕЙ ЭТОГО БОКСА) ---');
+      const relevantExternalConnections = globalExternalConnections.filter(conn => {
+          // Проверяем, участвует ли хотя бы один конец соединения во входящем или исходящем кабеле *данного* бокса
+          // И убеждаемся, что оба конца являются волокнами кабеля, так как внешние соединения только между кабелями.
+          if (isCableFiber(conn.end1) && isCableFiber(conn.end2)) {
+              const end1CableId = parseInt(conn.end1.cableId);
+              const end2CableId = parseInt(conn.end2.cableId);
+
+              const isEnd1RelatedToBox = (incomingCable && incomingCable.id === end1CableId) || outgoingCables.some(c => c.id === end1CableId);
+              const isEnd2RelatedToBox = (incomingCable && incomingCable.id === end2CableId) || outgoingCables.some(c => c.id === end2CableId);
+
+              return isEnd1RelatedToBox || isEnd2RelatedToBox;
+          }
+          return false;
+      });
+
+      if (relevantExternalConnections.length === 0) {
+          report.push('Нет внешних соединений, связанных с этим боксом.');
+      } else {
+          relevantExternalConnections.forEach((conn, i) => {
+              const end1Str = formatConnectionPoint(conn.end1, box.id);
+              const end2Str = formatConnectionPoint(conn.end2, box.id);
+              report.push(`${i + 1}. ${end1Str} <---> ${end2Str}`);
+          });
+      }
+
+      return report;
+  };
+
+  // НОВАЯ ФУНКЦИЯ: для расчета общего затухания сплиттера
+  function getSplitterTotalAttenuation(splitter: Splitter): number {
+    return SPLITTER_LOSSES[splitter.type]; // Возвращаем только затухание сплиттера
+  }
+
+  return (
+    <div style={{
+      position: 'fixed',
+      top: '50%',
+      left: '50%',
+      transform: 'translate(-50%, -50%)',
+      backgroundColor: 'white',
+      padding: '20px',
+      borderRadius: '8px',
+      boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
+      maxHeight: `${maxHeight}px`,
+      maxWidth: '1200px',
+      width: '90%',
+      overflow: 'hidden',
+      display: 'flex',
+      flexDirection: 'column',
+      zIndex: 1000,
+      ...style
+    }}>
+      {/* Заголовок */}
+      <div style={{
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: '20px'
+      }}>
+        <h2 style={{ margin: 0 }}>Детали бокса №{box.number}</h2>
+        <button onClick={onClose} style={{
+          background: 'none',
+          border: 'none',
+          fontSize: '20px',
+          cursor: 'pointer'
+        }}>×</button>
+      </div>
+
+      {/* Единая рабочая область (с прокруткой) */}
+      <div style={{ overflow: 'auto', flex: 1 }}>
+        {/* HTML секция для управления сплиттерами (вне SVG) */}
+        <div style={{ padding: '10px 20px 10px 20px', borderBottom: '1px dashed #eee', marginBottom: '10px' }}> {/* Уменьшил padding и marginBottom */}
+          <h3 style={{ margin: '5px 0' }}>Управление сплиттерами:</h3> {/* Уменьшил margin */}
+          <div style={{ marginBottom: '10px', display: 'flex', flexWrap: 'wrap', gap: '8px' }}> {/* Уменьшил marginBottom, добавил gap */}
+            <button onClick={() => handleAddSplitter(1)} style={{ padding: '6px 10px', cursor: 'pointer' }}>Добавить Сплиттер 1 ур.</button> {/* Уменьшил padding */}
+            <button onClick={() => handleAddSplitter(2)} style={{ padding: '6px 10px', cursor: 'pointer' }}>Добавить Сплиттер 2 ур.</button>
+            <button onClick={() => handleAddSplitter(3)} style={{ padding: '6px 10px', cursor: 'pointer' }}>Добавить Сплиттер 3 ур.</button>
+            <button 
+              onClick={() => {
+                if (!box) return;
+                const validation = validateBoxConnections(box);
+                if (validation.isValid) {
+                  alert('Проверка пройдена успешно! Все соединения корректны.');
+                } else {
+                  alert('Обнаружены ошибки:\n' + validation.errors.join('\n'));
+                }
+              }} 
+              style={{ 
+                marginLeft: '10px', 
+                padding: '8px 12px', 
+                cursor: 'pointer',
+                backgroundColor: '#4CAF50',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px'
+              }}
+            >
+              Проверить соединения
+            </button>
+            {/* НОВАЯ КНОПКА: Показать соединения */}
+            <button 
+              onClick={() => setShowConnectionsReport(true)}
+              style={{ 
+                marginLeft: '10px', 
+                padding: '8px 12px', 
+                cursor: 'pointer',
+                backgroundColor: '#0070c0', // Синий цвет
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px'
+              }}
+            >
+              Показать соединения
+            </button>
+          </div>
+          {/* ОБНОВЛЕННЫЙ БЛОК: Заголовок для списка сплиттеров и кнопка сворачивания */}
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            marginBottom: '5px' // Немного уменьшил отступ
+          }}>
+            <h4 style={{ margin: '0', cursor: 'pointer' }} onClick={() => setShowSplitterList(!showSplitterList)}>
+              Список сплиттеров ({splitters.length}) {showSplitterList ? '▼' : '►'}
+            </h4>
+          </div>
+          {/* Условное отображение списка сплиттеров */}
+          {showSplitterList && splitters.length > 0 && (
+            <div style={{ border: '1px solid #ccc', padding: '10px', borderRadius: '5px', backgroundColor: '#f9f9f9' }}>
+              {/* <h4 style={{ marginTop: 0, marginBottom: 10 }}>Список сплиттеров:</h4> */} {/* Удален дублирующий заголовок */}
+              {splitters.map((splitter) => (
+                <div key={splitter.id} style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  padding: '5px 0', // Уменьшил padding
+                  borderBottom: '1px dashed #eee',
+                }}>
+                  <span>
+                    Уровень: {splitter.level} |
+                    {/* НОВОЕ: Выпадающий список для выбора типа сплиттера */}
+                    Тип:
+                    <select
+                      value={splitter.type}
+                      onChange={(e) => handleUpdateSplitterType(splitter.id, e.target.value as Splitter['type'])}
+                      style={{ marginLeft: '5px', width: '80px', padding: '2px' }}
+                    >
+                      <option value="1x2">1x2</option>
+                      <option value="1x4">1x4</option>
+                      <option value="1x8">1x8</option>
+                      <option value="1x16">1x16</option>
+                    </select>
+                    {/* НОВОЕ: Выпадающий список для выбора типа коннектора */}
+                    | Коннектор:
+                    <select
+                      value={splitter.connectorType || 'null'} // Используем 'null' как строковое значение для отсутствия коннектора
+                      onChange={(e) => handleUpdateSplitterConnectorType(splitter.id, e.target.value === 'null' ? null : e.target.value as Splitter['connectorType'])}
+                      style={{ marginLeft: '5px', width: '100px', padding: '2px' }}
+                    >
+                      <option value="null">Без коннектора</option>
+                      <option value="SC/UPC">SC/UPC</option>
+                      <option value="SC/APC">SC/APC</option>
+                    </select>
+                    <br/>
+                    Номер:
+                    <input
+                      type="text"
+                      value={splitter.number}
+                      onChange={(e) => handleUpdateSplitterNumber(splitter.id, e.target.value)}
+                      style={{ marginLeft: '5px', width: '80px', padding: '2px' }} // Уменьшил padding
+                    />
+                    {/* НОВОЕ: Отображение затухания сплиттера */}
+                    <span style={{ marginLeft: '10px', fontSize: '12px', fontWeight: 'bold' }}>
+                      Затухание: {getSplitterTotalAttenuation(splitter).toFixed(1)} дБ
+                    </span>
+                  </span>
+                  <button onClick={() => handleDeleteSplitter(splitter.id)} style={{ marginLeft: '10px', background: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', padding: '4px 8px', cursor: 'pointer' }}>Удалить</button> {/* Уменьшил padding и margin */}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* SVG область для визуализации кабелей и сплиттеров */}
+        <svg
+          width={totalWidth}
+          height={svgCalculatedHeight}
+          style={{
+            border: '1px solid #ddd',
+            borderRadius: '4px',
+            padding: '20px',
+            boxSizing: 'border-box',
+            margin: '0 auto',
+            display: 'block'
+          }}
+        >
+          {/* Входящий кабель слева */}
+          {incomingCable && (
+            <>
+              {renderCableInfo(incomingCable, 'left', incomingCableHeaderY)}
+              <g transform={`translate(20, ${incomingCableFibersY})`}>
+                {getCableStructure(incomingCable.fiberCount).map((fiber, idx) => {
+                  const cableId = String(incomingCable.id);
+                  const point: ConnectionPoint = {
+                    type: 'cableFiber',
+                    cableId: cableId,
+                    fiberIdx: idx,
+                    direction: 'in' // Указываем направление
+                  };
+                  const isSelected = selectedConnectionPoint?.type === point.type &&
+                                   selectedConnectionPoint.cableId === point.cableId &&
+                                   selectedConnectionPoint.fiberIdx === point.fiberIdx &&
+                                   selectedConnectionPoint.direction === point.direction;
+                  const busy = isConnectionPointBusy(point); // Используем isConnectionPointBusy из CableDetailDialog
+                  const y = idx * rowHeight;
+
+                  return (
+                    <g key={`in-${idx}`} transform={`translate(0, ${y})`}>
+                      {renderCell(fiber.moduleColor.name, fiber.moduleColor.color, 120, 0, 0, fiber.moduleColor.border)}
+                      {renderCell(fiber.fiberColor.name, fiber.fiberColor.color, 120, 120, 0, fiber.fiberColor.border)}
+                      <g
+                        transform="translate(240, 0)"
+                        onClick={() => !busy && onConnectionPointClick(point)} // Используем новую функцию и `busy`
+                        style={{ cursor: busy ? 'not-allowed' : 'pointer' }}
+                      >
+                        <rect
+                          width={60}
+                          height={rowHeight}
+                          fill={isSelected ? '#ffe066' : busy ? '#e0e0e0' : '#fff'} // Обновляем цвет, если занято
+                        />
+                        <text
+                          x={30}
+                          y={rowHeight / 2}
+                          dominantBaseline="middle"
+                          textAnchor="middle"
+                          style={{ fontSize: '12px', fill: busy ? '#888' : '#000' }} // Обновляем цвет текста, если занято
+                        >
+                          {fiber.fiber}
+                        </text>
+                        <circle
+                          cx={60}
+                          cy={rowHeight / 2}
+                          r={4}
+                          fill="#0070c0"
+                          style={{ filter: 'drop-shadow(0 0 1px rgba(0,0,0,0.3))' }}
+                        />
+                      </g>
+                    </g>
+                  );
+                })}
+              </g>
+            </>
+          )}
+
+          {/* Секция для визуализации сплиттеров внутри SVG */}
+          {splitters.length > 0 && (
+            <g transform={`translate(20, ${splitterSectionY})`}>
+              {/* <text x="0" y="0" fontSize="14" fill="#333" fontWeight="bold">Визуализация сплиттеров (здесь будут SVG элементы):</text> */}
+              {splitters.map((splitter, sIdx) => {
+                // Динамический расчет Y-позиции для текущего сплиттера
+                let currentSplitterY = 0;
+                if (sIdx > 0) {
+                    for (let i = 0; i < sIdx; i++) {
+                        const prevSplitter = splitters[i];
+                        const prevPorts = getSplitterPortCounts(prevSplitter.type);
+                        const prevTotalPorts = prevPorts.input + prevPorts.outputs;
+                        const prevIndividualHeight = Math.max(40, prevTotalPorts * rowHeight + 20); // 40 - minSplitterHeight
+                        currentSplitterY += prevIndividualHeight + 20; // Высота предыдущего + отступ
+                    }
+                }
+                return (
+                  <React.Fragment key={splitter.id}>
+                    {renderSplitterSvg(splitter, currentSplitterY)}
+                  </React.Fragment>
+                );
+              })}
+            </g>
+          )}
+
+          {/* Линии внешних соединений (кабель-кабель) */}
+          {globalExternalConnections.map((conn, i) => { // Используем globalExternalConnections
+            if (!incomingCable) return null;
+
+            // Убеждаемся, что оба конца соединения являются волокнами кабеля
+            if (conn.end1.type === 'cableFiber' && conn.end2.type === 'cableFiber') {
+              // Явно сужаем тип для conn.end1 и conn.end2
+              const end1 = conn.end1;
+              const end2 = conn.end2;
+
+              const cable1 = cables.find(c => String(c.id) === end1.cableId);
+              const cable2 = cables.find(c => String(c.id) === end2.cableId);
+              if (!cable1 || !cable2) return null;
+
+              let x1, y1, x2, y2;
+              // Определяем координаты для end1
+              if (incomingCable && cable1.id === incomingCable.id) {
+                x1 = 320;
+                y1 = incomingCableFibersY + end1.fiberIdx * rowHeight + rowHeight / 2; // середина волокна
+              } else { // Если end1 - это исходящий кабель (на правой стороне)
+                const cable1Index = outgoingCables.findIndex(c => c.id === cable1.id);
+                if (cable1Index === -1) return null;
+                x1 = totalWidth - 380;
+                y1 = contentBaseY + outgoingCablesStartRelativeYPositions[cable1Index] + 35 + end1.fiberIdx * rowHeight + rowHeight / 2; // середина волокна исходящего
+              }
+
+              // Определяем координаты для end2
+              if (incomingCable && cable2.id === incomingCable.id) {
+                x2 = 320;
+                y2 = incomingCableFibersY + end2.fiberIdx * rowHeight + rowHeight / 2; // середина волокна
+              } else { // Если end2 - это исходящий кабель (на правой стороне)
+                const cable2Index = outgoingCables.findIndex(c => c.id === cable2.id);
+                if (cable2Index === -1) return null;
+                x2 = totalWidth - 380;
+                y2 = contentBaseY + outgoingCablesStartRelativeYPositions[cable2Index] + 35 + end2.fiberIdx * rowHeight + rowHeight / 2; // середина волокна исходящего
+              }
+
+              // НОВОЕ: Логика для изгиба вертикальных линий
+              let controlX1, controlY1, controlX2, controlY2;
+              const minHorizontalDistanceForBend = 10; // Если |x1 - x2| меньше этого значения, применяем изгиб
+              const bendMagnitude = 50; // На сколько пикселей изогнуть линию по горизонтали
+
+              if (Math.abs(x1 - x2) < minHorizontalDistanceForBend) {
+                  // Если точки находятся на одной вертикали (или очень близко), создаем изгиб
+                  // Определяем направление изгиба: если слева, то вправо; если справа, то влево
+                  const bendDirection = (x1 < totalWidth / 2) ? 1 : -1; 
+                  controlX1 = x1 + (bendDirection * bendMagnitude);
+                  controlX2 = x2 + (bendDirection * bendMagnitude);
+                  controlY1 = y1; // Сохраняем горизонтальную касательную в начале
+                  controlY2 = y2; // Сохраняем горизонтальную касательную в конце
+              } else {
+                  // Для горизонтальных или диагональных линий используем существующую логику
+                  controlX1 = x1 + (x2 - x1) * 0.25;
+                  controlX2 = x1 + (x2 - x1) * 0.75;
+                  controlY1 = y1;
+                  controlY2 = y2;
+              }
+
+              return (
+                <path
+                  key={i}
+                  d={`M ${x1} ${y1} C ${controlX1} ${controlY1}, ${controlX2} ${controlY2}, ${x2} ${y2}`}
+                  fill="none"
+                  stroke="#0070c0"
+                  strokeWidth={2}
+                  style={{ cursor: 'pointer', pointerEvents: 'all' }}
+                  onClick={() => onRemoveFiberConnection(i)}
+                >
+                  <title>{`Кабель #${end1.cableId} волокно #${end1.fiberIdx + 1} ↔ Кабель #${end2.cableId} волокно #${end2.fiberIdx + 1}`}</title>
+                </path>
+              );
+            }
+            return null; // Пропускаем соединения, которые не являются "кабель-кабель"
+          })}
+
+          {/* Линии внутренних соединений (сплиттер-сплиттер, волокно-сплиттер) */}
+          {internalConnections.map((conn, i) => { // Теперь используется локальное состояние internalConnections
+            // Определяем координаты для end1
+            let x1, y1, x2, y2;
+
+            // !!! Важное исправление позиций: теперь используем абсолютные координаты
+            // относительно начала SVG (0,0) для всех точек.
+            // Секция сплиттеров начинается с x=20 и y=splitterSectionY.
+            // Каждый сплиттер внутри этой секции смещен на sIdx * (singleSplitterSvgElementHeight + 20).
+
+            if (conn.end1.type === 'cableFiber') {
+              const cableFiberEnd1 = conn.end1;
+              const cable = cables.find(c => String(c.id) === cableFiberEnd1.cableId);
+              if (!cable) return null;
+
+              // Для входящего кабеля
+              if (cable.targetElement?.type === 'box' && cable.targetElement.id === box?.id) {
+                x1 = 20 + 240 + 60; // 20(padding) + 240(модуль+волокно) + 60(ширина_ячейки)
+                y1 = incomingCableFibersY + cableFiberEnd1.fiberIdx * rowHeight + rowHeight / 2;
+              }
+              // Для исходящего кабеля
+              else if (cable.sourceElement.type === 'box' && cable.sourceElement.id === box?.id) {
+                const cableIndex = outgoingCables.findIndex(c => c.id === cable.id);
+                if (cableIndex === -1) return null;
+                x1 = totalWidth - 380; // Начало исходящего кабеля
+                y1 = contentBaseY + outgoingCablesStartRelativeYPositions[cableIndex] + 35 + cableFiberEnd1.fiberIdx * rowHeight + rowHeight / 2;
+              } else {
+                return null;
+              }
+            } else if (conn.end1.type === 'splitterPort') {
+              const splitterPortEnd1 = conn.end1;
+              // Используем предрасчитанные координаты из Map
+              const coords = splitterPortCoordinates.get(JSON.stringify(splitterPortEnd1));
+              if (!coords) return null; 
+              x1 = coords.x;
+              y1 = coords.y;
+            } else {
+              return null;
+            }
+
+            // Определяем координаты для end2
+            if (conn.end2.type === 'cableFiber') {
+              const cableFiberEnd2 = conn.end2;
+              const cable = cables.find(c => String(c.id) === cableFiberEnd2.cableId);
+              if (!cable) return null;
+
+              // Для входящего кабеля
+              if (cable.targetElement?.type === 'box' && cable.targetElement.id === box?.id) {
+                x2 = 20 + 240 + 60; // 20(padding) + 240(модуль+волокно) + 60(ширина_ячейки)
+                y2 = incomingCableFibersY + cableFiberEnd2.fiberIdx * rowHeight + rowHeight / 2;
+              }
+              // Для исходящего кабеля
+              else if (cable.sourceElement.type === 'box' && cable.sourceElement.id === box?.id) {
+                const cableIndex = outgoingCables.findIndex(c => c.id === cable.id);
+                if (cableIndex === -1) return null;
+                x2 = totalWidth - 380; // Начало исходящего кабеля
+                y2 = contentBaseY + outgoingCablesStartRelativeYPositions[cableIndex] + 35 + cableFiberEnd2.fiberIdx * rowHeight + rowHeight / 2;
+              } else {
+                return null;
+              }
+            } else if (conn.end2.type === 'splitterPort') {
+              const splitterPortEnd2 = conn.end2;
+              // Используем предрасчитанные координаты из Map
+              const coords = splitterPortCoordinates.get(JSON.stringify(splitterPortEnd2));
+              if (!coords) return null;
+              x2 = coords.x;
+              y2 = coords.y;
+            } else {
+              return null;
+            }
+
+            // НОВОЕ: Логика для изгиба вертикальных линий (повторяем ту же логику)
+            let controlX1, controlY1, controlX2, controlY2;
+            const minHorizontalDistanceForBend = 10; // Если |x1 - x2| меньше этого значения, применяем изгиб
+            const bendMagnitude = 50; // На сколько пикселей изогнуть линию по горизонтали
+
+            if (Math.abs(x1 - x2) < minHorizontalDistanceForBend) {
+                // Если точки находятся на одной вертикали (или очень близко), создаем изгиб
+                const bendDirection = (x1 < totalWidth / 2) ? 1 : -1; // Изгиб вправо, если слева; влево, если справа
+                controlX1 = x1 + (bendDirection * bendMagnitude);
+                controlX2 = x2 + (bendDirection * bendMagnitude);
+                controlY1 = y1; // Сохраняем горизонтальную касательную
+                controlY2 = y2; // Сохраняем горизонтальную касательную
+            } else {
+                // Для горизонтальных или диагональных линий используем существующую логику
+                controlX1 = x1 + (x2 - x1) * 0.25;
+                controlX2 = x1 + (x2 - x1) * 0.75;
+                controlY1 = y1;
+                controlY2 = y2;
+            }
+
+            // Цвет для внутренних соединений (например, оранжевый)
+            return (
+              <path
+                key={`internal-conn-${i}`}
+                d={`M ${x1} ${y1} C ${controlX1} ${controlY1}, ${controlX2} ${controlY2}, ${x2} ${y2}`}
+                fill="none"
+                stroke="#ff9900" // Оранжевый цвет для внутренних соединений
+                strokeWidth={2}
+                style={{ cursor: 'pointer', pointerEvents: 'all' }}
+                onClick={() => {
+                  // Логика удаления внутреннего соединения
+                  const updatedInternalConnections = internalConnections.filter((_, idx) => idx !== i);
+                  setInternalConnections(updatedInternalConnections);
+                  onUpdateBoxInternalConnections(box.id, updatedInternalConnections);
+                }}
+              >
+                <title>{`Внутреннее соединение`}</title>
+              </path>
+            );
+          })}
+
+
+          {/* Исходящие кабели справа */}
+          {outgoingCables.length > 0 && (
+            <g transform={`translate(0, ${contentBaseY})`}>
+              {outgoingCables.map((cable, cableIndex) => {
+                const cableGroupOverallY = outgoingCablesStartRelativeYPositions[cableIndex];
+                return (
+                  <g key={`out-${cable.id}`} transform={`translate(0, ${cableGroupOverallY})`}>
+                    <g transform={`translate(${totalWidth - 380}, 35)`}>
+                      {getCableStructure(cable.fiberCount).map((fiber, idx) => {
+                        const cableId = String(cable.id);
+                        const point: ConnectionPoint = {
+                          type: 'cableFiber',
+                          cableId: cableId,
+                          fiberIdx: idx,
+                          direction: 'out' // Указываем направление
+                        };
+                        const isSelected = selectedConnectionPoint?.type === point.type &&
+                                         selectedConnectionPoint.cableId === point.cableId &&
+                                         selectedConnectionPoint.fiberIdx === point.fiberIdx &&
+                                         selectedConnectionPoint.direction === point.direction;
+                        const busy = isConnectionPointBusy(point); // Используем isConnectionPointBusy из CableDetailDialog
+                        const y = idx * rowHeight;
+
+                        return (
+                          <g key={`out-${idx}`} transform={`translate(0, ${y})`}>
+                            <g
+                              transform="translate(0, 0)"
+                              onClick={() => !busy && onConnectionPointClick(point)} // Используем новую функцию и `busy`
+                              style={{ cursor: busy ? 'not-allowed' : 'pointer' }}
+                            >
+                              <rect
+                                width={60}
+                                height={rowHeight}
+                                fill={isSelected ? '#ffe066' : busy ? '#e0e0e0' : '#fff'} // Обновляем цвет, если занято
+                              />
+                              <text
+                                x={30}
+                                y={rowHeight / 2}
+                                dominantBaseline="middle"
+                                textAnchor="middle"
+                                style={{ fontSize: '12px', fill: busy ? '#888' : '#000' }} // Обновляем цвет текста, если занято
+                              >
+                                {fiber.fiber}
+                              </text>
+                              <circle
+                                cx={0}
+                                cy={rowHeight / 2}
+                                r={4}
+                                fill="#0070c0"
+                                style={{ filter: 'drop-shadow(0 0 1px rgba(0,0,0,0.3))' }}
+                              />
+                            </g>
+                            {renderCell(fiber.fiberColor.name, fiber.fiberColor.color, 120, 60, 0, fiber.fiberColor.border)}
+                            {renderCell(fiber.moduleColor.name, fiber.moduleColor.color, 120, 180, 0, fiber.moduleColor.border)}
+                          </g>
+                        );
+                      })}
+                    </g>
+                  </g>
+                );
+              })}
+            </g>
+          )}
+        </svg>
+      </div>
+      
+      {/* НОВОЕ МОДАЛЬНОЕ ОКНО: Отчет по соединениям */}
+      {showConnectionsReport && (
+          <div style={{
+              position: 'fixed',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              backgroundColor: 'white',
+              padding: '20px',
+              borderRadius: '8px',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
+              maxHeight: `${maxHeight * 0.8}px`, // Немного меньше, чем основное окно
+              maxWidth: '600px',
+              width: '80%',
+              overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
+              zIndex: 6001, // Выше, чем основное окно
+              border: '1px solid #ccc'
+          }}>
+              <div style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: '15px'
+              }}>
+                  <h3 style={{ margin: 0 }}>Отчет по соединениям бокса №{box.number}</h3>
+                  <button onClick={() => setShowConnectionsReport(false)} style={{
+                      background: 'none',
+                      border: 'none',
+                      fontSize: '20px',
+                      cursor: 'pointer'
+                  }}>×</button>
+              </div>
+              <div style={{ flex: 1, overflowY: 'auto', border: '1px solid #eee', padding: '10px', borderRadius: '4px' }}>
+                  {generateConnectionReport().map((line, index) => (
+                      <p key={index} style={{ margin: '5px 0', fontSize: '14px', whiteSpace: 'pre-wrap' }}>{line}</p>
+                  ))}
+              </div>
+          </div>
+      )}
+    </div>
+  );
+}
+
+function AddBoxOnMap({ onMapClick, enabled }: { onMapClick: (pos: [number, number]) => void, enabled: boolean }) {
+  useMapEvents({
+    click(e: any) {
+      if (enabled) {
+        onMapClick([e.latlng.lat, e.latlng.lng]);
+      }
+    }
+  });
+  return null;
+}
+
+function AddCableOnMap({ onMapClick, enabled }: { onMapClick: (pos: [number, number]) => void, enabled: boolean }) {
+  useMapEvents({
+    click(e: any) {
+      if (enabled) {
+        onMapClick([e.latlng.lat, e.latlng.lng]);
+      }
+    }
+  });
+  return null;
+}
+
+function AddPoleOnMap({ onMapClick, enabled }: { onMapClick: (pos: [number, number]) => void, enabled: boolean }) {
+  useMapEvents({
+    click(e: any) {
+      if (enabled) {
+        onMapClick([e.latlng.lat, e.latlng.lng]);
+      }
+    }
+  });
+  return null;
+}
+
+function AddWellOnMap({ onMapClick, enabled }: { onMapClick: (pos: [number, number]) => void, enabled: boolean }) {
+  useMapEvents({
+    click(e: any) {
+      if (enabled) {
+        onMapClick([e.latlng.lat, e.latlng.lng]);
+      }
+    }
+  });
+  return null;
+}
+function App() {
+  const [boxes, setBoxes] = useState<Box[]>([]);
+  const [selectedBox, setSelectedBox] = useState<Box | null>(null);
+  const [addBoxMode, setAddBoxMode] = useState(false);
+  const [addSpliceClosureMode, setAddSpliceClosureMode] = useState(false);
+  const [addCableMode, setAddCableMode] = useState(false);
+  const [addPoleMode, setAddPoleMode] = useState(false);
+  const [addWellMode, setAddWellMode] = useState(false);
+  const [newBoxPosition, setNewBoxPosition] = useState<[number, number] | null>(null);
+  const [boxParams, setBoxParams] = useState({ 
+    number: "", 
+    address: "", 
+    place: "" 
+  });
+
+  const [cables, setCables] = useState<Cable[]>([]);
+  const [cablePoints, setCablePoints] = useState<[number, number][]>([]);
+  const [selectedCableId, setSelectedCableId] = useState<number | null>(null);
+
+  const [fiberConnections, setFiberConnections] = useState<InternalConnection[]>([]);
+
+  const [selectedConnectionPoint, setSelectedConnectionPoint] = useState<ConnectionPoint | null>(null);
+
+  // НОВОЕ СОСТОЯНИЕ: для муфт
+  const [spliceClosures, setSpliceClosures] = useState<SpliceClosure[]>([]);
+  const [newSpliceClosurePosition, setNewSpliceClosurePosition] = useState<[number, number] | null>(null);
+  const [spliceClosureParams, setSpliceClosureParams] = useState({ number: "", address: "", place: "" });
+  const [showSpliceClosureDetails, setShowSpliceClosureDetails] = useState(false);
+
+  const leftTableRef = useRef<HTMLDivElement>(null);
+  const rightTableRef = useRef<HTMLDivElement>(null);
+  const [svgHeight, setSvgHeight] = useState(0);
+  const [svgWidth, setSvgWidth] = useState(0);
+  const [svgLeftOffset, setSvgLeftOffset] = useState(0);
+
+  const [maxHeight, setMaxHeight] = useState(600);
+  const [rowHeight] = useState(24);
+  const [svgWidthFixed] = useState(150);
+  const [contentHeight, setContentHeight] = useState(0);
+  const [viewportWidth, setViewportWidth] = useState(window.innerWidth);
+  const [viewportHeight, setViewportHeight] = useState(window.innerHeight);
+
+  const [poles, setPoles] = useState<Pole[]>([]);
+  const [selectedPoleId, setSelectedPoleId] = useState<number | null>(null);
+  const [poleParams, setPoleParams] = useState({ number: '', tpNumber: '', purpose: '0,4кВт' as Pole['purpose'] });
+  const [draggedLabelPoleId, setDraggedLabelPoleId] = useState<number | null>(null);
+  const [labelDragOffset, setLabelDragOffset] = useState<[number, number] | null>(null);
+
+  const [wells, setWells] = useState<Well[]>([]);
+  const [selectedWellId, setSelectedWellId] = useState<number | null>(null);
+  const [wellParams, setWellParams] = useState<Well>({
+    id: 0,
+    position: [0, 0],
+    number: '',
+    labelOffset: [0, 0]
+  });
+
+  const [selectedElement, setSelectedElement] = useState<SelectedElement>(null);
+  const [openedBoxId, setOpenedBoxId] = useState<number | null>(null);
+
+  // НОВОЕ СОСТОЯНИЕ: для временных проектных расчетов по кабелям
+  const [projectedCableWork, setProjectedCableWork] = useState<Record<number, CableProjectedWork>>({}); // Key: cable ID, Value: Map of work type -> details
+
+  const [boxesOpen, setBoxesOpen] = useState(true);
+  const [cablesOpen, setCablesOpen] = useState(true);
+  const [polesOpen, setPolesOpen] = useState(true);
+  const [wellsOpen, setWellsOpen] = useState(true);
+  const [splittersOpen, setSplittersOpen] = useState(false); // Изменено с true на false
+  const [spliceClosuresOpen, setSpliceClosuresOpen] = useState(true); // НОВОЕ СОСТОЯНИЕ: для муфт
+  // НОВОЕ СОСТОЯНИЕ: для сворачивания/разворачивания раздела "Работы по кабелю (факт)"
+  const [showActualWorks, setShowActualWorks] = useState(false); // Изменено с true на false
+  // НОВОЕ СОСТОЯНИЕ: для сворачивания/разворачивания раздела "Работы по кабелю (проект)"
+  const [showProjectedWorks, setShowProjectedWorks] = useState(false); // Изменено с true на false
+
+  const [isFileMenuOpen, setIsFileMenuOpen] = useState(false);
+  const [isPassportsMenuOpen, setIsPassportsMenuOpen] = useState(false);
+  const [isProtocolsMenuOpen, setIsProtocolsMenuOpen] = useState(false);
+  const [isExportMenuOpen, setIsExportMenuOpen] = useState(false);
+  const [isAnalysisMenuOpen, setIsAnalysisMenuOpen] = useState(false); // <-- Добавил состояние для "Анализ"
+
+  const [activeTab, setActiveTab] = useState('situational');
+
+  const tabs = [
+    { id: 'situational', label: 'Ситуационный план' },
+    { id: 'network', label: 'Структура сети' },
+    { id: 'splicing', label: 'Схема розварки' }, // Добавляем новую вкладку
+    { id: 'house', label: 'Домовые сети' },
+    { id: 'materials', label: 'Спецификация материалов' },
+    { id: 'works', label: 'Спецификация работ' },
+  ];
+
+  const handleTabChange = (tabId: string) => {
+    setActiveTab(tabId);
+  };
+
+  useEffect(() => {
+    const handleResize = () => {
+      setViewportWidth(window.innerWidth);
+      setViewportHeight(window.innerHeight);
+      setMaxHeight(window.innerHeight * 0.8);
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // Состояния для кабельных соединений
+  const [cableStart, setCableStart] = useState<CableEndpoint | null>(null);
+  const [cableEnd, setCableEnd] = useState<CableEndpoint | null>(null);
+
+  const [showCableParamsModal, setShowCableParamsModal] = useState(false);
+
+  const [newCableParams, setNewCableParams] = useState<{
+    fiberCount: number;
+    layingType: 'подвес' | 'канализация';
+  }>({
+    fiberCount: 12,
+    layingType: 'подвес'
+  });
+
+  useEffect(() => {
+    const updateSvgDimensions = () => {
+      const leftTable = leftTableRef.current?.getBoundingClientRect();
+      const rightTable = rightTableRef.current?.getBoundingClientRect();
+      const centerContainer = document.querySelector('.center-container')?.getBoundingClientRect();
+
+      if (leftTable && rightTable && centerContainer) {
+        // Рассчитываем ширину SVG
+        const svgWidth = rightTable.right - leftTable.left + 100; // Добавляем запас
+
+        // Рассчитываем высоту SVG
+        const maxRows = Math.max(
+          leftTable.height || 0,
+          rightTable.height || 0
+        );
+        const svgHeight = maxRows + 50; // Добавляем запас
+
+        // Рассчитываем смещение SVG
+        const svgLeftOffset = leftTable.left - centerContainer.left;
+
+        // Устанавливаем размеры и смещение
+        setSvgWidth(svgWidth);
+        setSvgHeight(svgHeight);
+        setSvgLeftOffset(svgLeftOffset);
+
+        console.log('SVG Dimensions:', { svgWidth, svgHeight, svgLeftOffset });
+      } else {
+        // Если расчёты не удались, задаём резервные значения
+        setSvgWidth(800); // Резервная ширина
+        setSvgHeight(400); // Резервная высота
+        setSvgLeftOffset(0); // Резервное смещение
+        console.error('Не удалось получить размеры таблиц или контейнера.');
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      updateSvgDimensions();
+    }, 0);
+
+    window.addEventListener('resize', updateSvgDimensions);
+    return () => {
+      clearTimeout(timeout);
+      window.removeEventListener('resize', updateSvgDimensions);
+    };
+  }, []);
+
+  const handleMapClick = (position: [number, number]) => {
+    if (addBoxMode) {
+      setNewBoxPosition(position);
+      // Убираем setAddBoxMode(false) отсюда
+    }
+  };
+
+  const handleAddBox = (position: [number, number]) => {
+    const newBox: Box = {
+      id: boxes.length + 1,
+      position,
+      number: boxParams.number,
+      address: boxParams.address,
+      place: boxParams.place,
+      connections: {
+        input: null,
+        outputs: Array(6).fill(null)
+      },
+      splitters: [
+        {
+          id: `splitter-1-level2`,
+          type: '1x8',
+          connectorType: null, // Без коннекторов по умолчанию
+          level: 2, // Второй уровень
+          number: '' // Пустой номер по умолчанию
+        }
+      ],
+      internalFiberConnections: [],
+      status: 'projected',
+      oltTerminalNo: '',
+      oltPortNo: '',
+      model: 'FOB-05-24', // Инициализация по умолчанию, можно выбрать другое
+    };
+    setBoxes([...boxes, newBox]);
+    setNewBoxPosition(null);
+    setAddBoxMode(false);
+    setBoxParams({ number: "", address: "", place: "" });
+  };
+
+  const handleSaveBox = () => {
+    if (!newBoxPosition) return;
+    handleAddBox(newBoxPosition);
+  };
+
+  const handleMarkerDblClick = (boxId: number) => {
+    setOpenedBoxId(boxId);
+    boxIdToUpdateInternalConnections.current = boxId; // Сохраняем ID бокса для обновления внутренних соединений
+  };
+
+  const handleCloseDetails = () => {
+    setOpenedBoxId(null);
+    boxIdToUpdateInternalConnections.current = null; // Очищаем ID при закрытии
+  };
+
+  const handleMarkerDragEnd = (elementId: number, elementType: 'box' | 'spliceClosure', e: DragEndEvent) => {
+    const { lat, lng } = (e.target as L.Marker).getLatLng();
+    
+    // Обновляем позицию элемента (бокса или муфты)
+    if (elementType === 'box') {
+      setBoxes(boxes => boxes.map(b =>
+        b.id === elementId ? { ...b, position: [lat, lng] } : b
+      ));
+    } else if (elementType === 'spliceClosure') {
+      setSpliceClosures(spliceClosures => spliceClosures.map(s =>
+        s.id === elementId ? { ...s, position: [lat, lng] } : s
+      ));
+    }
+
+    // Обновляем точки кабелей, связанных с этим элементом
+    setCables(cables => cables.map(cable => {
+      let shouldUpdate = false;
+      let newPoints = [...cable.points];
+
+      // Проверяем начало кабеля
+      if (cable.sourceElement?.type === elementType && cable.sourceElement.id === elementId) {
+        newPoints[0] = [lat, lng];
+        shouldUpdate = true;
+      }
+
+      // Проверяем конец кабеля
+      if (cable.targetElement && cable.targetElement.type === elementType && cable.targetElement.id === elementId) {
+        newPoints[newPoints.length - 1] = [lat, lng];
+        shouldUpdate = true;
+      }
+
+      return shouldUpdate ? { ...cable, points: newPoints } : cable;
+    }));
+  };
+
+  const handleBoxClick = (boxId: number, position: [number, number]) => {
+    if (addCableMode) {
+      if (!cableStart) {
+        // Начинаем новый кабель
+        setCableStart({ elementId: boxId, elementType: 'box', position });
+        setCablePoints([position]);
+        setCableEnd(null);
+      } else if (!cableEnd && boxId !== cableStart.elementId) {
+        // Завершаем кабель
+        setCablePoints(points => [...points, position]);
+        setCableEnd({ elementId: boxId, elementType: 'box', position });
+        setShowCableParamsModal(true);
+        setNewCableParams({ fiberCount: 12, layingType: 'подвес' }); // значения по умолчанию
+      }
+    }
+  };
+
+  const handleCableClick = (cableId: number) => {
+    setSelectedCableId(cableId);
+  };
+
+  const handleCableMapClick = (pos: [number, number]) => {
+    if (addCableMode && cableStart && !cableEnd) {
+      setCablePoints(points => [...points, pos]);
+    }
+  };
+
+  const handleCableConnection = (elementId: number, elementType: 'box' | 'spliceClosure') => {
+    if (selectedCableId) {
+      const selectedCable = cables.find(c => c.id === selectedCableId);
+      if (!selectedCable) return;
+      
+      const updatedCable = { ...selectedCable };
+      
+      // Проверяем, не пытаемся ли мы соединить элемент сам с собой
+      if (updatedCable.sourceElement?.id === elementId && 
+          updatedCable.sourceElement?.type === elementType) {
+        return;
+      }
+      
+      // Устанавливаем source или target в зависимости от того, что еще не установлено
+      if (!updatedCable.sourceElement) {
+        updatedCable.sourceElement = { type: elementType, id: elementId };
+        updatedCable.points[0] = elementType === 'box'
+          ? boxes.find(b => b.id === elementId)!.position
+          : spliceClosures.find(s => s.id === elementId)!.position;
+      } else if (!updatedCable.targetElement) {
+        updatedCable.targetElement = { type: elementType, id: elementId };
+        updatedCable.points[updatedCable.points.length - 1] = elementType === 'box'
+          ? boxes.find(b => b.id === elementId)!.position
+          : spliceClosures.find(s => s.id === elementId)!.position;
+        
+        // После установки обоих концов проверяем валидность соединения
+        const sourceElement = updatedCable.sourceElement.type === 'box' 
+          ? boxes.find(b => b.id === updatedCable.sourceElement!.id)
+          : spliceClosures.find(s => s.id === updatedCable.sourceElement!.id);
+          
+        const targetElement = updatedCable.targetElement.type === 'box'
+          ? boxes.find(b => b.id === updatedCable.targetElement!.id)
+          : spliceClosures.find(s => s.id === updatedCable.targetElement!.id);
+          
+        if (!sourceElement || !targetElement) {
+          console.error('Не удалось найти элементы для соединения');
+          return;
+        }
+      }
+      
+      setCables(cables.map(c => c.id === selectedCableId ? updatedCable : c));
+    }
+  };
+
+  const handleSaveCableWithParams = () => {
+    if (!cableStart || !cableEnd) return;
+
+    const newCable: Cable = {
+      id: cables.length + 1,
+      points: cablePoints,
+      sourceElement: { type: cableStart.elementType, id: cableStart.elementId },
+      targetElement: cableEnd ? { type: cableEnd.elementType, id: cableEnd.elementId } : null,
+      fiberCount: newCableParams.fiberCount,
+      layingType: newCableParams.layingType,
+      status: 'projected' as const,
+      model: CABLE_MODELS[newCableParams.fiberCount]?.[0] || '',
+      oltTerminalNo: '',
+      oltPortNo: '',
+      actualCableLength: 0, // Инициализация
+      actualMarkA: 0,       // Инициализация как число
+      actualMarkB: 0,       // Инициализация как число
+      actualWorkMetConst: 0, // Инициализация
+      actualWorkTK: 0,       // Инициализация
+      actualWorkInGround: 0, // Инициализация
+      actualWorkExitLKS: 0,  // Инициализация
+      actualWorkSuspension: 0, // Инициализация
+      actualWorkOnWall: 0,   // Инициализация
+      actualWorkOnRiser: 0,  // Инициализация
+    };
+
+    // Если тип прокладки - канализация, инициализируем sewerageWorkDetails
+    if (newCable.layingType === 'канализация') {
+      newCable.sewerageWorkDetails = {
+        reserve: 0,
+        sections: [0],
+      };
+    }
+
+    setCables([...cables, newCable]);
+    setShowCableParamsModal(false);
+    setAddCableMode(false);
+    setCableStart(null);
+    setCableEnd(null);
+    setCablePoints([]);
+  };
+
+  // Drag промежуточных точек
+  const handleCablePointDragEnd = (cableId: number, pointIdx: number, e: DragEndEvent) => {
+    const { lat, lng } = (e.target as L.Marker).getLatLng();
+    setCables(cables => cables.map(cable => {
+      if (cable.id === cableId) {
+        const newPoints = [...cable.points];
+        
+        // Если это начальная или конечная точка, проверяем тип элемента
+        if (pointIdx === 0 && cable.sourceElement) {
+          const sourceElement = cable.sourceElement.type === 'box'
+            ? boxes.find(b => b.id === cable.sourceElement!.id)
+            : spliceClosures.find(s => s.id === cable.sourceElement!.id);
+          if (sourceElement) {
+            newPoints[0] = sourceElement.position;
+            return { ...cable, points: newPoints };
+          }
+        }
+        
+        if (pointIdx === newPoints.length - 1 && cable.targetElement) {
+          const targetElement = cable.targetElement.type === 'box'
+            ? boxes.find(b => b.id === cable.targetElement!.id)
+            : spliceClosures.find(s => s.id === cable.targetElement!.id);
+          if (targetElement) {
+            newPoints[newPoints.length - 1] = targetElement.position;
+            return { ...cable, points: newPoints };
+          }
+        }
+        
+        newPoints[pointIdx] = [lat, lng];
+        return { ...cable, points: newPoints };
+      }
+      return cable;
+    }));
+  }; 
+
+  console.log('cablePoints', cablePoints);
+  console.log('fiberConnections:', fiberConnections);
+
+  // Обновляем вызов функции в handleConnectionPointClick
+  function handleConnectionPointClick(point: ConnectionPoint) {
+    // Используем обновленную глобальную функцию для проверки занятости
+    // Обратите внимание: `openedBoxId` здесь не передается, т.к. `isConnectionPointBusyGlobal` теперь сама итерируется по всем боксам
+    if (isConnectionPointBusyGlobal(point, boxes, fiberConnections)) return;
+
+    if (!selectedConnectionPoint) {
+      setSelectedConnectionPoint(point);
+    } else {
+      // Проверка на совпадение типов точек и конкретных ID (для отмены выбора)
+      if (selectedConnectionPoint.type === point.type) {
+        if (point.type === 'cableFiber' && selectedConnectionPoint.type === 'cableFiber') {
+          if (selectedConnectionPoint.cableId === point.cableId && 
+              selectedConnectionPoint.fiberIdx === point.fiberIdx) {
+            setSelectedConnectionPoint(null);
+            return;
+          }
+        }
+        if (point.type === 'splitterPort' && selectedConnectionPoint.type === 'splitterPort') {
+          if (selectedConnectionPoint.splitterId === point.splitterId && 
+              selectedConnectionPoint.portType === point.portType && 
+              selectedConnectionPoint.portIdx === point.portIdx) {
+            setSelectedConnectionPoint(null);
+            return;
+          }
+        }
+      }
+      
+      // Обе точки должны быть свободны (повторная проверка на случай, если первая точка стала занятой между кликами)
+      // Используем обновленную глобальную функцию
+      if (isConnectionPointBusyGlobal(selectedConnectionPoint, boxes, fiberConnections)) {
+        setSelectedConnectionPoint(null);
+        return;
+      }
+
+      // Определяем, является ли соединение внутренним (хотя бы один конец - порт сплиттера)
+      const isInternalConnection = 
+        selectedConnectionPoint.type === 'splitterPort' || point.type === 'splitterPort';
+
+      if (isInternalConnection) {
+        // Это внутреннее соединение, связанное со сплиттером
+        if (openedBoxId !== null) { // Убеждаемся, что диалог бокса открыт
+          setBoxes(prevBoxes => prevBoxes.map(box => {
+            if (box.id === openedBoxId) {
+              return {
+                ...box,
+                internalFiberConnections: [...box.internalFiberConnections, { end1: selectedConnectionPoint, end2: point }]
+              };
+            }
+            return box;
+          }));
+        } else {
+            // Если мы пытаемся создать внутреннее соединение, но диалог бокса не открыт - это логическая ошибка
+            console.warn("Попытка создать внутреннее соединение вне контекста открытого бокса.");
+            alert("Не удалось создать соединение: бокс не выбран.");
+        }
+      } else {
+        // Это внешнее соединение (кабель-кабель)
+        setFiberConnections(prev => [...prev, {
+          end1: selectedConnectionPoint,
+          end2: point
+        }]);
+      }
+      
+      setSelectedConnectionPoint(null);
+    }
+  }
+
+  function handleExportToKMZ() {
+    const zip = new JSZip();
+
+    // Генерация KML
+    const kmlContent = generateKML();
+    zip.file('doc.kml', kmlContent);
+
+    // Генерация KMZ
+    zip.generateAsync({ type: 'blob' }).then((content) => {
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(content);
+      link.download = 'export.kmz';
+      link.click();
+    });
+  }
+
+  function generateKML() {
+    const kmlHeader = `<?xml version="1.0" encoding="UTF-8"?>
+      <kml xmlns="http://www.opengis.net/kml/2.2">
+        <Document>
+          <name>Экспорт данных</name>
+          <!-- Стили для кабелей -->
+          <Style id="cable-4">
+            <LineStyle>
+              <color>ff000000</color> <!-- Чёрный -->
+              <width>5</width> <!-- Увеличена толщина -->
+            </LineStyle>
+          </Style>
+          <Style id="cable-8">
+            <LineStyle>
+              <color>ff0000ff</color> <!-- Красный -->
+              <width>5</width> <!-- Увеличена толщина -->
+            </LineStyle>
+          </Style>
+          <Style id="cable-12">
+            <LineStyle>
+              <color>ff00ff00</color> <!-- Зелёный -->
+              <width>5</width> <!-- Увеличена толщина -->
+            </LineStyle>
+          </Style>
+          <Style id="cable-24">
+            <LineStyle>
+              <color>ffff0000</color> <!-- Синий -->
+              <width>5</width> <!-- Увеличена толщина -->
+            </LineStyle>
+          </Style>
+          <Style id="cable-48">
+            <LineStyle>
+              <color>ff00ffff</color> <!-- Оранжевый -->
+              <width>5</width> <!-- Увеличена толщина -->
+            </LineStyle>
+          </Style>
+          <Style id="cable-96">
+            <LineStyle>
+              <color>ff703000</color> <!-- Коричневый -->
+              <width>5</width> <!-- Увеличена толщина -->
+            </LineStyle>
+          </Style>
+          <Style id="cable-144">
+            <LineStyle>
+              <color>ff7030a0</color> <!-- Фиолетовый -->
+              <width>5</width> <!-- Увеличена толщина -->
+            </LineStyle>
+          </Style>
+    `;
+
+    const kmlFooter = `
+        </Document>
+      </kml>
+    `;
+
+    // Генерация боксов
+    const boxesKML = boxes.map((box) => `
+      <Placemark>
+        <name>Бокс №${box.number}</name>
+        <description>
+          <![CDATA[
+            <b>Адрес:</b> ${box.address}<br/>
+            <b>Место:</b> ${box.place}
+          ]]>
+        </description>
+        <Point>
+          <coordinates>${box.position[1]},${box.position[0]},0</coordinates>
+        </Point>
+      </Placemark>
+    `).join('');
+
+    // Генерация кабелей
+    const cablesKML = cables.map((cable) => `
+      <Placemark>
+        <name>Кабель ID: ${cable.id}</name>
+        <description>
+          <![CDATA[
+            <b>Тип:</b> ${cable.layingType}<br/>
+            <b>Длина:</b> ${calculateCableLength(cable.points).toFixed(1)} м<br/>
+            <b>Волоконность:</b> ${cable.fiberCount}
+          ]]>
+        </description>
+        <styleUrl>#cable-${cable.fiberCount}</styleUrl>
+        <LineString>
+          <coordinates>
+            ${cable.points.map((point) => `${point[1]},${point[0]},0`).join(' ')}
+          </coordinates>
+        </LineString>
+      </Placemark>
+    `).join('');
+
+    return `${kmlHeader}${boxesKML}${cablesKML}${kmlFooter}`;
+  }
+
+  function handleRemoveFiberConnection(idx: number) {
+    setFiberConnections(fiberConnections => fiberConnections.filter((_, i) => i !== idx));
+  }
+
+  // Глобальная проверка занятости волокна (для handleFiberClick)
+  function isFiberBusyGlobal(cableId: string, fiberIdx: number) {
+    return fiberConnections.some(conn => {
+      const checkEnd = (end: ConnectionPoint) => {
+        if (end.type === 'cableFiber') {
+          return end.cableId === cableId && end.fiberIdx === fiberIdx;
+        }
+        return false;
+      };
+      return checkEnd(conn.end1) || checkEnd(conn.end2);
+    });
+  }
+
+  function getPoleIcon(purpose: string) {
+    let fill = '#00b050'; // зелёный по умолчанию
+    if (purpose === '10кВт') fill = '#ff0000';
+    if (purpose === 'УТК') fill = '#ffe066';
+    if (purpose === 'Освещение') fill = '#00bfff';
+    return new DivIcon({
+      className: '',
+      iconSize: [24, 24],
+      iconAnchor: [12, 12],
+      html: `
+        <svg width="24" height="24" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="12" cy="12" r="8" fill="${fill}" stroke="black" stroke-width="1.5" />
+          <line x1="12" y1="4" x2="12" y2="20" stroke="black" stroke-width="1.5" />
+          <line x1="4" y1="12" x2="20" y2="12" stroke="black" stroke-width="1.5" />
+        </svg>
+      `
+    });
+  }
+
+  function handleMapClickPole(position: [number, number]) {
+    setPoles([...poles, {
+      id: Date.now(),
+      position,
+      number: '',
+      tpNumber: '',
+      purpose: '0,4кВт',
+      labelOffset: [4, 0]
+    }]);
+  }
+
+  const selectedPole = poles.find(p => p.id === selectedPoleId);
+  function handlePolePropertyChange(field: keyof Pole, value: any) {
+    setPoles(poles => poles.map(p =>
+      p.id === selectedPoleId ? { ...p, [field]: value } : p
+    ));
+  }
+  function handlePolePositionChange(newPos: [number, number]) {
+    setPoles(poles => poles.map(p =>
+      p.id === selectedPoleId ? { ...p, position: newPos } : p
+    ));
+  }
+  function handleLabelDragStart(poleId: number, e: any) {
+    // Проверяем, что e существует и есть clientX/clientY
+    if (!e || typeof e.clientX !== 'number' || typeof e.clientY !== 'number') return;
+    setDraggedLabelPoleId(poleId);
+    setLabelDragOffset([e.clientX, e.clientY]);
+  }
+  function handleLabelDrag(e: any) {
+    if (draggedLabelPoleId !== null && labelDragOffset) {
+      const dx = e.clientX - labelDragOffset[0];
+      const dy = e.clientY - labelDragOffset[1];
+      setPoles(poles => poles.map(p =>
+        p.id === draggedLabelPoleId ? { ...p, labelOffset: [p.labelOffset[0] + dx, p.labelOffset[1] + dy] } : p
+      ));
+      setLabelDragOffset([e.clientX, e.clientY]);
+    }
+  }
+  function handleLabelDragEnd() {
+    setDraggedLabelPoleId(null);
+    setLabelDragOffset(null);
+  }
+  useEffect(() => {
+    if (draggedLabelPoleId !== null) {
+      window.addEventListener('mousemove', handleLabelDrag);
+      window.addEventListener('mouseup', handleLabelDragEnd);
+      return () => {
+        window.removeEventListener('mousemove', handleLabelDrag);
+        window.removeEventListener('mouseup', handleLabelDragEnd);
+      };
+    }
+  }, [draggedLabelPoleId, labelDragOffset]);
+
+  function handleMapClickWell(position: [number, number]) {
+    setWells([...wells, {
+      id: Date.now(),
+      position,
+      number: '',
+      labelOffset: [4, 0]
+    }]);
+  }
+
+  const selectedWell = wells.find(w => w.id === selectedWellId);
+  function handleWellPropertyChange(field: keyof Well, value: any) {
+    setWells(wells => wells.map(w =>
+      w.id === selectedWellId ? { ...w, [field]: value } : w
+    ));
+  }
+
+  // === Обработчики выбора элементов ===
+  function handleSelectBox(boxId: number) {
+    setSelectedElement({ type: 'box', id: boxId });
+  }
+  function handleSelectCable(cableId: number) {
+    setSelectedElement({ type: 'cable', id: cableId });
+  }
+  function handleSelectPole(poleId: number) {
+    setSelectedElement({ type: 'pole', id: poleId });
+  }
+  function handleSelectWell(wellId: number) {
+    setSelectedElement({ type: 'well', id: wellId });
+  }
+
+  // === Для защиты от конфликта click/dblclick ===
+  const clickTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // === Обработчики кликов для дерева элементов ===
+  const handleToggleBoxes = () => setBoxesOpen(!boxesOpen);
+  const handleToggleCables = () => setCablesOpen(!cablesOpen);
+  const handleTogglePoles = () => setPolesOpen(!polesOpen);
+  const handleToggleWells = () => setWellsOpen(!wellsOpen);
+  const handleToggleSplitters = () => setSplittersOpen(!splittersOpen); // НОВАЯ ФУНКЦИЯ: для открытия/закрытия списка сплиттеров
+  const handleToggleSpliceClosures = () => setSpliceClosuresOpen(!spliceClosuresOpen);
+
+  // === Функции переключения меню ===
+  const toggleFileMenu = () => {
+    setIsFileMenuOpen(prevState => !prevState);
+    setIsPassportsMenuOpen(false);
+    setIsProtocolsMenuOpen(false);
+    setIsExportMenuOpen(false);
+    setIsAnalysisMenuOpen(false); // <-- Закрываем меню "Анализ"
+  };
+
+  const toggleEditMenu = () => {
+    // setIsEditMenuOpen(prevState => !prevState); // Если будет состояние для Правки
+    setIsFileMenuOpen(false);
+    setIsPassportsMenuOpen(false);
+    setIsProtocolsMenuOpen(false);
+    setIsExportMenuOpen(false);
+    setIsAnalysisMenuOpen(false); // <-- Закрываем меню "Анализ"
+  };
+
+  const togglePassportsMenu = () => {
+    setIsPassportsMenuOpen(prevState => !prevState);
+    setIsFileMenuOpen(false);
+    setIsProtocolsMenuOpen(false);
+    setIsExportMenuOpen(false);
+    setIsAnalysisMenuOpen(false); // <-- Закрываем меню "Анализ"
+  };
+
+  const toggleProtocolsMenu = () => {
+    setIsProtocolsMenuOpen(prevState => !prevState);
+    setIsFileMenuOpen(false);
+    setIsPassportsMenuOpen(false);
+    setIsExportMenuOpen(false);
+    setIsAnalysisMenuOpen(false); // <-- Закрываем меню "Анализ"
+  };
+
+  const toggleExportMenu = () => {
+    setIsExportMenuOpen(prevState => !prevState);
+    setIsFileMenuOpen(false);
+    setIsPassportsMenuOpen(false);
+    setIsProtocolsMenuOpen(false);
+    setIsAnalysisMenuOpen(false); // <-- Закрываем меню "Анализ"
+  };
+
+   const toggleAnalysisMenu = () => { // <-- НОВАЯ ФУНКЦИЯ для "Анализ"
+    setIsAnalysisMenuOpen(prevState => !prevState);
+    setIsFileMenuOpen(false);
+    setIsPassportsMenuOpen(false);
+    setIsProtocolsMenuOpen(false);
+    setIsExportMenuOpen(false);
+  };
+
+  // Функция для закрытия всех меню (например, при клике вне меню) - опционально, но хорошая практика
+  const closeAllMenus = () => {
+    setIsFileMenuOpen(false);
+    setIsPassportsMenuOpen(false);
+    setIsProtocolsMenuOpen(false);
+    setIsExportMenuOpen(false);
+    setIsAnalysisMenuOpen(false); // <-- Добавляем закрытие меню "Анализ"
+    setIsImportMenuOpen(false); // Добавляем закрытие меню импорта
+  };
+
+  // === Функции для экспорта в Excel ===
+  const handleExportBoxReport = () => {
+    const boxData = boxes.map(box => {
+      // Находим входящий кабель
+      const incomingCable = cables.find(cable => cable.targetElement?.type === 'box' && cable.targetElement.id === box.id);
+      
+      // Находим исходящие кабели
+      const outgoingCables = cables.filter(cable => cable.sourceElement.type === 'box' && cable.sourceElement.id === box.id);
+
+      return {
+        ID: box.id,
+        Номер: box.number,
+        Адрес: box.address,
+        Место: box.place,
+        Координаты: `${box.position[0].toFixed(6)}, ${box.position[1].toFixed(6)}`,
+        Входящий_кабель_ID: incomingCable ? incomingCable.id : '',
+        Исходящие_кабели_ID: outgoingCables.map(c => c.id).join(', ')
+      };
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(boxData);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Отчет по боксам');
+
+    const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+    const data = new Blob([excelBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;charset=UTF-8' });
+    saveAs(data, 'Отчет_Бокс.xlsx');
+  };
+
+  const handleExportCableReport = () => {
+    const cableData = cables.map(cable => {
+      const sourceBox = boxes.find(box => box.id === cable.sourceElement.id);
+      const targetBox = boxes.find(box => box.id === cable.targetElement?.id);
+      const length = calculateCableLength(cable.points).toFixed(1);
+
+      const totalSewerageLength = cable.sewerageWorkDetails 
+        ? (cable.sewerageWorkDetails.reserve || 0) + cable.sewerageWorkDetails.sections.reduce((sum, val) => sum + val, 0)
+        : 0;
+
+      return {
+        ID: cable.id,
+        'Источник (Бокс ID)': cable.sourceElement.id,
+        'Источник (Номер бокса)': sourceBox ? sourceBox.number : 'Неизвестно',
+        'Назначение (Бокс ID)': cable.targetElement?.id,
+        'Назначение (Номер бокса)': targetBox ? targetBox.number : 'Неизвестно',
+        Волоконность: cable.fiberCount,
+        'Тип прокладки': cable.layingType,
+        'Марка кабеля': cable.model,
+        '№ терминала (OLT)': cable.oltTerminalNo || '',
+        '№ порта (OLT Port)': cable.oltPortNo || '',
+        Длина_м: length,
+        'Состояние': cable.status,
+        'Работы_Канализация_Общая_Длина_м': cable.layingType === 'канализация' ? totalSewerageLength.toFixed(2) : '',
+        // НОВЫЕ ФАКТИЧЕСКИЕ ПОЛЯ ДЛЯ ЭКСПОРТА
+        'Длина кабеля (факт)': cable.actualCableLength || 0,
+        'Метка А (факт)': cable.actualMarkA || '',
+        'Метка Б (факт)': cable.actualMarkB || '',
+        'по мет. конст. (факт)': cable.actualWorkMetConst || 0,
+        'по т/к (факт)': cable.actualWorkTK || 0,
+        'в грунте (факт)': cable.actualWorkInGround || 0,
+        'выход из ЛКС (факт)': cable.actualWorkExitLKS || 0,
+        'подвес (факт)': cable.actualWorkSuspension || 0,
+        'по стене (факт)': cable.actualWorkOnWall || 0,
+        'по стояку (факт)': cable.actualWorkOnRiser || 0,
+        Количество_точек: cable.points.length,
+        Координаты_точек: cable.points.map(pt => `(${pt[0].toFixed(6)}, ${pt[1].toFixed(6)})`).join('; ')
+      };
+    });
+
+    const worksheet = XLSX.utils.json_to_sheet(cableData);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Отчет по кабелям');
+
+    const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+    const data = new Blob([excelBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;charset=UTF-8' });
+    saveAs(data, 'Отчет_ВОК.xlsx');
+  };
+  // === Конец функций для экспорта в Excel ===
+
+  // Добавляем новое состояние для меню импорта
+  const [isImportMenuOpen, setIsImportMenuOpen] = useState(false);
+
+  // Добавляем функцию переключения меню импорта
+  const toggleImportMenu = () => {
+    setIsImportMenuOpen(prevState => !prevState);
+    setIsFileMenuOpen(false);
+    setIsPassportsMenuOpen(false);
+    setIsProtocolsMenuOpen(false);
+    setIsExportMenuOpen(false);
+    setIsAnalysisMenuOpen(false);
+  };
+
+  // Добавляем функции для импорта
+  const handleImportBoxReport = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.xlsx';
+    
+    input.onchange = (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const data = new Uint8Array(event.target?.result as ArrayBuffer);
+          const workbook = XLSX.read(data, { type: 'array' });
+          const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+          const jsonData = XLSX.utils.sheet_to_json(worksheet);
+
+          if (!jsonData || jsonData.length === 0) {
+            alert('Файл не содержит данных');
+            return;
+          }
+
+          // Обновляем боксы
+          const newBoxes = jsonData.map((row: any) => {
+            if (!row.Координаты) {
+              throw new Error('Отсутствуют координаты в данных');
+            }
+
+            const [lat, lng] = row.Координаты.split(',').map((coord: string) => {
+              const num = parseFloat(coord.trim());
+              if (isNaN(num)) {
+                throw new Error('Некорректный формат координат');
+              }
+              return num;
+            });
+
+            return {
+              id: row.ID || Math.max(...boxes.map(b => b.id), 0) + 1,
+              position: [lat, lng] as [number, number],
+              number: row.Номер || '',
+              address: row.Адрес || '',
+              place: row.Место || '',
+              connections: {
+                input: row.Входящий_кабель_ID ? { cableId: row.Входящий_кабель_ID } : null,
+                outputs: row.Исходящие_кабели_ID ? 
+                  row.Исходящие_кабели_ID.split(',').map((id: string) => ({ cableId: parseInt(id.trim()) })) : 
+                  Array(6).fill(null)
+              },
+              splitters: [],
+              internalFiberConnections: [],
+              // Явно проверяем тип status при импорте
+              status: (row.Состояние === 'existing' || row.Состояние === 'projected') ? row.Состояние : 'projected',
+              oltTerminalNo: row['№ терминала (OLT)'] || '',
+              oltPortNo: row['№ порта (OLT Port)'] || '',
+              // НОВОЕ ПОЛЕ: Модель бокса (берем из импорта или ставим по умолчанию)
+              model: (['FOB-02-04-04LC', 'FOB-03-12-08LC', 'FOB-04-16-16LC', 'FOB-05-24-24LC',
+                       'FOB-02-04-04SC', 'FOB-03-12-08SC', 'FOB-04-16-16SC', 'FOB-05-24-24SC',
+                       'FOB-05-24'].includes(row['Модель бокса'])) ? row['Модель бокса'] : 'FOB-05-24',
+            } as Box; // Явно приводим каждый элемент к типу Box
+          });
+
+          setBoxes(newBoxes);
+          alert(`Успешно импортировано ${newBoxes.length} боксов`);
+        } catch (error: unknown) {
+          if (error instanceof Error) {
+            alert(`Ошибка при импорте: ${error.message}`);
+          } else {
+            alert('Произошла неизвестная ошибка при импорте');
+          }
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    };
+    
+    input.click();
+  };
+
+  const handleImportCableReport = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.xlsx';
+    
+    input.onchange = (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const data = new Uint8Array(event.target?.result as ArrayBuffer);
+          const workbook = XLSX.read(data, { type: 'array' });
+          const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+          const jsonData = XLSX.utils.sheet_to_json(worksheet);
+
+          if (!jsonData || jsonData.length === 0) {
+            alert('Файл не содержит данных');
+            return;
+          }
+
+          // Обновляем кабели
+          const newCables = jsonData.map((row: any) => {
+            if (!row.Координаты_точек) {
+              throw new Error('Отсутствуют координаты точек в данных');
+            }
+
+            const points = row.Координаты_точек.split(';').map((point: string) => {
+              const [lat, lng] = point.replace(/[()]/g, '').split(',').map(coord => {
+                const num = parseFloat(coord.trim());
+                if (isNaN(num)) {
+                  throw new Error('Некорректный формат координат');
+                }
+                return num;
+              });
+              return [lat, lng] as [number, number];
+            });
+
+            if (points.length < 2) {
+              throw new Error('Кабель должен иметь минимум 2 точки');
+            }
+
+            // Убеждаемся, что status корректно импортируется
+            const importedStatus: Cable['status'] = 
+              (row.Состояние === 'existing' || row.Состояние === 'projected') 
+                ? row.Состояние 
+                : 'projected'; // Дефолтное значение, если в файле нет или оно некорректно
+
+            // Убеждаемся, что model корректно импортируется
+            const importedModel = row['Марка кабеля'] || (CABLE_MODELS[row.Волоконность]?.[0] || '');
+
+            const importedSewerageWorkDetails = row['Канализация_Запас'] !== undefined || row['Канализация_Участки'] !== undefined 
+              ? {
+                  reserve: typeof row['Канализация_Запас'] === 'number' ? row['Канализация_Запас'] : 0,
+                  sections: typeof row['Канализация_Участки'] === 'string' 
+                    ? row['Канализация_Участки'].split(';').map(s => parseFloat(s.trim())).filter(n => !isNaN(n))
+                    : [],
+                }
+              : undefined;
+
+            return {
+              id: row.ID || Math.max(...cables.map(c => c.id), 0) + 1,
+              sourceElement: { type: 'box' as const, id: row['Источник (Бокс ID)'] || null },
+              targetElement: row['Назначение (Бокс ID)'] ? { type: 'box' as const, id: row['Назначение (Бокс ID)'] } : null,
+              fiberCount: row.Волоконность || 4,
+              layingType: row['Тип прокладки'] || 'подвес',
+              points: points,
+              status: importedStatus,
+              model: importedModel,
+              sewerageWorkDetails: importedSewerageWorkDetails,
+              oltTerminalNo: row['№ терминала (OLT)'] || '',
+              oltPortNo: row['№ порта (OLT Port)'] || '',
+              // НОВЫЕ ФАКТИЧЕСКИЕ ПОЛЯ ДЛЯ ИМПОРТА
+              actualCableLength: parseFloat(row['Длина кабеля (факт)'] || 0),
+              actualMarkA: parseFloat(row['Метка А (факт)'] || 0),  // Парсим в число
+              actualMarkB: parseFloat(row['Метка Б (факт)'] || 0),  // Парсим в число
+              actualWorkMetConst: parseFloat(row['по мет. конст. (факт)'] || 0),
+              actualWorkTK: parseFloat(row['по т/к (факт)'] || 0),
+              actualWorkInGround: parseFloat(row['в грунте (факт)'] || 0),
+              actualWorkExitLKS: parseFloat(row['выход из ЛКС (факт)'] || 0),
+              actualWorkSuspension: parseFloat(row['подвес (факт)'] || 0),
+              actualWorkOnWall: parseFloat(row['по стене (факт)'] || 0),
+              actualWorkOnRiser: parseFloat(row['по стояку (факт)'] || 0),
+            };
+          });
+
+          setCables(newCables);
+          alert(`Успешно импортировано ${newCables.length} кабелей`);
+        } catch (error: unknown) {
+          if (error instanceof Error) {
+            alert(`Ошибка при импорте: ${error.message}`);
+          } else {
+            alert('Произошла неизвестная ошибка при импорте');
+          }
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    };
+    
+    input.click();
+  };
+
+  const boxIdToUpdateInternalConnections = useRef<number | null>(null);
+
+  // НОВАЯ ФУНКЦИЯ: для удаления бокса
+  const handleDeleteBox = (boxId: number) => {
+    // Удаляем бокс из массива боксов
+    const updatedBoxes = boxes.filter(box => box.id !== boxId);
+    setBoxes(updatedBoxes);
+    
+    // Закрываем окно деталей бокса
+    setSelectedElement(null);
+    
+    // Удаляем все кабели, связанные с этим боксом
+    const updatedCables = cables.filter(cable => 
+      cable.sourceElement.id !== boxId && cable.targetElement?.id !== boxId
+    );
+    setCables(updatedCables);
+  };
+
+  // НОВАЯ ФУНКЦИЯ: для удаления кабеля
+  const handleDeleteCable = (cableId: number) => {
+    // Удаляем кабель из массива кабелей
+    const updatedCables = cables.filter(cable => cable.id !== cableId);
+    setCables(updatedCables);
+    
+    // Если удаленный кабель был выбран, сбрасываем выбор
+    if (selectedElement?.type === 'cable' && selectedElement.id === cableId) {
+      setSelectedElement(null);
+    }
+
+    // Также нужно удалить все внутренние и внешние соединения, связанные с этим кабелем
+    // Удаляем внешние соединения, где участвует этот кабель
+    const updatedFiberConnections = fiberConnections.filter(conn => {
+      // Проверяем, является ли одно из концов соединением с волокном данного кабеля
+      const isEnd1ThisCableFiber = conn.end1.type === 'cableFiber' && parseInt(conn.end1.cableId) === cableId;
+      const isEnd2ThisCableFiber = conn.end2.type === 'cableFiber' && parseInt(conn.end2.cableId) === cableId;
+      return !(isEnd1ThisCableFiber || isEnd2ThisCableFiber);
+    });
+    setFiberConnections(updatedFiberConnections);
+
+    // Удаляем внутренние соединения в боксах, где участвует этот кабель
+    setBoxes(prevBoxes => prevBoxes.map(box => {
+      const updatedInternalConnections = box.internalFiberConnections.filter(internalConn => {
+        const isInternalEnd1ThisCableFiber = internalConn.end1.type === 'cableFiber' && parseInt(internalConn.end1.cableId) === cableId;
+        const isInternalEnd2ThisCableFiber = internalConn.end2.type === 'cableFiber' && parseInt(internalConn.end2.cableId) === cableId;
+        return !(isInternalEnd1ThisCableFiber || isInternalEnd2ThisCableFiber);
+      });
+      // Также очищаем ссылки на удаленный кабель в box.connections
+      const newBoxConnections = { ...box.connections };
+      if (newBoxConnections.input?.cableId === cableId) {
+        newBoxConnections.input = null;
+      }
+      newBoxConnections.outputs = newBoxConnections.outputs.map(output => 
+        output?.cableId === cableId ? null : output
+      );
+
+      return {
+        ...box,
+        internalFiberConnections: updatedInternalConnections,
+        connections: newBoxConnections
+      };
+    }));
+  };
+
+  // НОВЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ для проектных расчетов
+  const WORK_TYPE_LABELS = {
+    'actualWorkMetConst': 'по мет. конст.',
+    'actualWorkTK': 'по т/к',
+    'actualWorkInGround': 'в грунте',
+    'actualWorkExitLKS': 'выход из ЛКС',
+    'actualWorkSuspension': 'подвес',
+    'actualWorkOnWall': 'по стене',
+    'actualWorkOnRiser': 'по стояку',
+  };
+
+  const handleUpdateProjectedReserve = (cableId: number, workTypeLabel: string, value: number) => {
+    setProjectedCableWork(prev => ({
+      ...prev,
+      [cableId]: {
+        ...(prev[cableId] || {}),
+        [workTypeLabel]: {
+          ...(prev[cableId]?.[workTypeLabel] || { reserve: 0, sections: [] }),
+          reserve: value,
+        },
+      },
+    }));
+  };
+
+  const handleAddProjectedSection = (cableId: number, workTypeLabel: string) => {
+    setProjectedCableWork(prev => {
+      const currentCableWorks = prev[cableId] || {};
+      const currentWorkTypeDetails = currentCableWorks[workTypeLabel];
+
+      if (!currentWorkTypeDetails) {
+        // Если нет деталей для этого типа работ, инициализируем их и показываем
+        return {
+          ...prev,
+          [cableId]: {
+            ...currentCableWorks,
+            [workTypeLabel]: { reserve: 0, sections: [], showDetails: true }, // Инициализируем с showDetails: true
+          },
+        };
+      } else {
+        // Если детали уже существуют, добавляем новый участок и убеждаемся, что они показаны
+        return {
+          ...prev,
+          [cableId]: {
+            ...currentCableWorks,
+            [workTypeLabel]: {
+              ...currentWorkTypeDetails,
+              sections: [...currentWorkTypeDetails.sections, 0],
+              showDetails: true, // Убеждаемся, что видимость включена
+            },
+          },
+        };
+      }
+    });
+  };
+
+  const handleUpdateProjectedSection = (cableId: number, workTypeLabel: string, sectionIdx: number, value: number) => {
+    setProjectedCableWork(prev => {
+      const currentWork = prev[cableId]?.[workTypeLabel];
+      if (!currentWork) return prev;
+
+      const newSections = [...currentWork.sections];
+      newSections[sectionIdx] = value;
+      return {
+        ...prev,
+        [cableId]: {
+          ...(prev[cableId] || {}),
+          [workTypeLabel]: {
+            ...currentWork,
+            sections: newSections,
+          },
+        },
+      };
+    });
+  };
+
+  const handleRemoveProjectedSection = (cableId: number, workTypeLabel: string, sectionIdx: number) => {
+    setProjectedCableWork(prev => {
+      const currentWork = prev[cableId]?.[workTypeLabel];
+      if (!currentWork) return prev;
+
+      const newSections = currentWork.sections.filter((_, idx) => idx !== sectionIdx);
+      return {
+        ...prev,
+        [cableId]: {
+          ...(prev[cableId] || {}),
+          [workTypeLabel]: {
+            ...currentWork,
+            sections: newSections,
+          },
+        },
+      };
+    });
+  };
+
+  const calculateProjectedTotal = (cableId: number, workTypeLabel: string) => {
+    const workDetails = projectedCableWork[cableId]?.[workTypeLabel];
+    if (!workDetails) return 0;
+    const totalSectionsSum = workDetails.sections.reduce((sum, val) => sum + val, 0);
+    const baseTotal = workDetails.reserve + totalSectionsSum;
+
+    // НОВАЯ ФОРМУЛА РАСЧЕТА: только для "по т/к"
+    if (workTypeLabel === 'по т/к') {
+      const numberOfSections = workDetails.sections.length; // Количество участков
+      return (baseTotal * 1.057) + numberOfSections;
+    }
+    // НОВАЯ ФОРМУЛА РАСЧЕТА: только для "подвес"
+    if (workTypeLabel === 'подвес') {
+      return baseTotal * 1.027;
+    }
+    return baseTotal; // Для всех остальных типов работ возвращаем просто сумму
+  };
+
+  // НОВАЯ ФУНКЦИЯ: Удалить запас (с возможностью свернуть раздел)
+  const handleRemoveProjectedReserve = (cableId: number, workTypeLabel: string) => {
+    setProjectedCableWork(prev => {
+      const currentCableWorks = { ...(prev[cableId] || {}) };
+      const currentWorkTypeDetails = currentCableWorks[workTypeLabel];
+
+      if (!currentWorkTypeDetails) return prev; 
+
+      // Устанавливаем запас в 0
+      const updatedWorkTypeDetails = { ...currentWorkTypeDetails, reserve: 0, showDetails: currentWorkTypeDetails.showDetails }; // Сохраняем состояние showDetails
+
+      // Если после сброса запаса нет и участков, то удаляем весь тип работ
+      if (updatedWorkTypeDetails.reserve === 0 && updatedWorkTypeDetails.sections.length === 0) {
+        const newCableWorks = { ...currentCableWorks };
+        delete newCableWorks[workTypeLabel]; // Удаляем запись для данного типа работ
+        return {
+          ...prev,
+          [cableId]: newCableWorks,
+        };
+      } else {
+        // Иначе просто обновляем запас
+        return {
+          ...prev,
+          [cableId]: {
+            ...currentCableWorks,
+            [workTypeLabel]: updatedWorkTypeDetails,
+          },
+        };
+      }
+    });
+  };
+
+  // НОВАЯ ФУНКЦИЯ: Переключение видимости деталей для конкретного вида работ
+  const handleToggleProjectedWorkDetails = (cableId: number, workTypeLabel: string) => {
+    setProjectedCableWork(prev => {
+      const currentCableWorks = { ...(prev[cableId] || {}) };
+      const currentWorkTypeDetails = currentCableWorks[workTypeLabel];
+
+      if (!currentWorkTypeDetails) {
+        // Если деталей нет, создаем их и показываем
+        return {
+          ...prev,
+          [cableId]: {
+            ...currentCableWorks,
+            [workTypeLabel]: { reserve: 0, sections: [], showDetails: true },
+          },
+        };
+      } else {
+        // Иначе просто переключаем showDetails
+        return {
+          ...prev,
+          [cableId]: {
+            ...currentCableWorks,
+            [workTypeLabel]: {
+              ...currentWorkTypeDetails,
+              showDetails: !currentWorkTypeDetails.showDetails,
+            },
+          },
+        };
+      }
+    });
+  };
+
+  // НОВАЯ ФУНКЦИЯ: Определяет, какую длину кабеля отображать на карте (приоритет: факт > проект > трасса)
+  const getDisplayCableLength = (cable: Cable): string => {
+    // 1. Проверяем фактическую длину
+    const actualTotalLength = (cable.actualWorkMetConst || 0) +
+                              (cable.actualWorkTK || 0) +
+                              (cable.actualWorkInGround || 0) +
+                              (cable.actualWorkExitLKS || 0) +
+                              (cable.actualWorkSuspension || 0) +
+                              (cable.actualWorkOnWall || 0) +
+                              (cable.actualWorkOnRiser || 0);
+
+    if (actualTotalLength > 0) {
+        return `${Math.ceil(actualTotalLength).toFixed(1)} м`; // Округляем вверх до целого, показываем .0
+    }
+
+    // 2. Если фактической нет, проверяем проектную
+    const projectedOverallTotal = Object.keys(WORK_TYPE_LABELS).reduce((sum, key) => {
+        const label = WORK_TYPE_LABELS[key as keyof typeof WORK_TYPE_LABELS];
+        return sum + calculateProjectedTotal(cable.id, label);
+    }, 0);
+
+    if (projectedOverallTotal > 0) {
+        return `${Math.ceil(projectedOverallTotal).toFixed(1)} м`; // Округляем вверх до целого, показываем .0
+    }
+
+    // 3. Если ни фактической, ни проектной нет, всегда показываем "0.0 м"
+    return `0.0 м`;
+  };
+
+  // НОВЫЕ ИНТЕРФЕЙСЫ ДЛЯ СПЕЦИФИКАЦИИ МАТЕРИАЛОВ
+  interface MaterialItem {
+    id: string;
+    name: string;
+    quantity: number;
+    unit: string;
+  }
+
+  interface MaterialCategory {
+    id: string;
+    name: string;
+    items: MaterialItem[];
+  }
+
+  // ФУНКЦИЯ ДЛЯ ПОДСЧЕТА МАТЕРИАЛОВ (ОБНОВЛЕНО: с группировкой и фильтрацией по статусу)
+  const calculateMaterials = (): MaterialCategory[] => {
+    // Вспомогательная функция для агрегации (группировки) материалов
+    const aggregateItems = (items: MaterialItem[]): MaterialItem[] => {
+      const aggregatedMap = new Map<string, MaterialItem>(); // Key: item.name
+
+      items.forEach(item => {
+        if (aggregatedMap.has(item.name)) {
+          const existingItem = aggregatedMap.get(item.name)!;
+          // Суммируем количество, если единица измерения одинакова
+          if (existingItem.unit === item.unit) {
+            existingItem.quantity += item.quantity;
+          } else {
+            // Если единицы измерения разные, это должно быть обработано отдельно
+            // В данном случае, пока просто добавим как отдельный элемент
+            // Можно добавить логирование или более сложную логику, если нужно.
+            aggregatedMap.set(`${item.name}-${item.id}`, item); // Добавляем с уникальным ID для избежания конфликта ключей
+          }
+        } else {
+          aggregatedMap.set(item.name, { ...item }); // Делаем копию, чтобы не менять исходный объект
+        }
+      });
+      // Преобразуем Map обратно в массив
+      return Array.from(aggregatedMap.values());
+    };
+
+    // Категория "Боксы"
+    const boxItems: MaterialItem[] = boxes
+      .filter(box => box.status !== 'existing') // Исключаем существующие боксы
+      .map(box => ({
+        id: `box-${box.id}`, // Временно, будет заменено после агрегации
+        name: box.model,
+        quantity: 1,
+        unit: 'шт.'
+      }));
+    const boxesCategory: MaterialCategory = {
+      id: 'boxes',
+      name: 'Боксы',
+      items: aggregateItems(boxItems)
+    };
+
+    // Категория "Сплиттеры"
+    const splitterItems: MaterialItem[] = boxes
+      .filter(box => box.status !== 'existing') // Исключаем сплиттеры из существующих боксов
+      .flatMap(box =>
+        box.splitters.map(splitter => ({
+          id: `splitter-${splitter.id}`, // Временно
+          name: `Сплиттер ${splitter.type} ${splitter.connectorType || 'без коннектора'}`,
+          quantity: 1,
+          unit: 'шт.'
+        }))
+      );
+    const splittersCategory: MaterialCategory = {
+      id: 'splitters',
+      name: 'Сплиттеры',
+      items: aggregateItems(splitterItems)
+    };
+
+    // Категория "Кабели"
+    const cableItems: MaterialItem[] = cables
+      .filter(cable => cable.status !== 'existing') // Исключаем существующие кабели
+      .map(cable => ({
+        id: `cable-${cable.id}`, // Временно
+        name: `${cable.model} ${cable.fiberCount} волокон`,
+        quantity: calculateProjectedTotal(cable.id, 'по мет. конст.') + // Добавляем все проектные работы
+                  calculateProjectedTotal(cable.id, 'по т/к') +
+                  calculateProjectedTotal(cable.id, 'в грунте') +
+                  calculateProjectedTotal(cable.id, 'выход из ЛКС') +
+                  calculateProjectedTotal(cable.id, 'подвес') +
+                  calculateProjectedTotal(cable.id, 'по стене') +
+                  calculateProjectedTotal(cable.id, 'по стояку'),
+        unit: 'м'
+      }));
+    const cablesCategory: MaterialCategory = {
+      id: 'cables',
+      name: 'Кабели',
+      // Для кабелей, вместо quantity: 1, мы используем суммарную проектную длину
+      // и агрегируем их по названию, чтобы получить общую длину для каждой марки
+      items: aggregateItems(cableItems)
+    };
+
+    return [boxesCategory, splittersCategory, cablesCategory];
+  };
+
+  // КОМПОНЕНТ ДЛЯ ОТОБРАЖЕНИЯ СПЕЦИФИКАЦИИ
+  const MaterialsSpecification = () => {
+    const materials = calculateMaterials();
+
+    return (
+      <div style={{ padding: '20px', overflowY: 'auto', flex: 1 }}> {/* Добавляем overflowY и flex: 1 */}
+        <h2 style={{ marginBottom: '20px' }}>Спецификация материалов</h2>
+        
+        {materials.map(category => (
+          <div key={category.id} style={{ marginBottom: '30px' }}>
+            <h3 style={{ 
+              backgroundColor: '#094961', 
+              color: 'white', 
+              padding: '10px',
+              marginBottom: '15px',
+              borderRadius: '4px'
+            }}>
+              {category.name}
+            </h3>
+            
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ backgroundColor: '#f5f5f5' }}>
+                  <th style={{ padding: '10px', textAlign: 'left', borderBottom: '2px solid #ddd' }}>Наименование</th>
+                  <th style={{ padding: '10px', textAlign: 'right', borderBottom: '2px solid #ddd', width: '100px' }}>Количество</th>
+                  <th style={{ padding: '10px', textAlign: 'left', borderBottom: '2px solid #ddd', width: '80px' }}>Ед. изм.</th>
+                </tr>
+              </thead>
+              <tbody>
+                {category.items.map(item => (
+                  <tr key={item.id} style={{ borderBottom: '1px solid #eee' }}>
+                    <td style={{ padding: '10px' }}>{item.name}</td>
+                    <td style={{ padding: '10px', textAlign: 'right' }}>{item.unit === 'м' ? item.quantity.toFixed(2) : item.quantity}</td>{/* Форматируем метры */}
+                    <td style={{ padding: '10px' }}>{item.unit}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  // НОВЫЕ ИНТЕРФЕЙСЫ ДЛЯ СПЕЦИФИКАЦИИ РАБОТ
+  interface WorkItem {
+    id: string;
+    name: string;
+    quantity: number;
+    unit: string;
+  }
+
+  interface WorkCategory {
+    id: string;
+    name: string;
+    items: WorkItem[];
+  }
+
+  // ФУНКЦИЯ ДЛЯ ПОДСЧЕТА РАБОТ
+  const calculateWorks = (): WorkCategory[] => {
+    const categories: WorkCategory[] = [];
+
+    // Вспомогательная функция для агрегации (группировки) элементов работ
+    const aggregateWorkItems = (items: WorkItem[]): WorkItem[] => {
+      const aggregatedMap = new Map<string, WorkItem>();
+
+      items.forEach(item => {
+        if (aggregatedMap.has(item.name)) {
+          const existingItem = aggregatedMap.get(item.name)!;
+          if (existingItem.unit === item.unit) {
+            existingItem.quantity += item.quantity;
+          } else {
+            // Если единицы измерения разные, добавляем как отдельный элемент
+            // Или если название уже уникальное (как для агрегированных кабельных работ), просто добавляем.
+            aggregatedMap.set(`${item.name}-${item.id}`, item);
+          }
+        } else {
+          aggregatedMap.set(item.name, { ...item }); // Делаем копию, чтобы не менять исходный объект
+        }
+      });
+      return Array.from(aggregatedMap.values());
+    };
+
+    // 1. Работы по боксам
+    const projectedBoxes = boxes.filter(box => box.status === 'projected');
+    const boxWorks: WorkItem[] = [
+      {
+        id: 'box-installation',
+        name: 'Установка бокса',
+        quantity: projectedBoxes.length,
+        unit: 'шт.'
+      }
+    ];
+    categories.push({ id: 'box-works', name: 'Работы по боксам', items: aggregateWorkItems(boxWorks) });
+
+    // 2. Работы по сплиттерам
+    // ИЗМЕНЕНИЕ: Убираем фильтрацию по статусу бокса, чтобы считать ВСЕ сплиттеры
+    const allSplitters = boxes.flatMap(box => box.splitters);
+
+    const splittersWithoutConnector: Record<Splitter['type'], number> = {
+      '1x2': 0, '1x4': 0, '1x8': 0, '1x16': 0
+    };
+    let totalSplittersWithConnector = 0;
+
+    allSplitters.forEach(splitter => { // Используем allSplitters
+      if (splitter.connectorType === null) {
+        // Сплиттеры без коннектора, подсчитываем по каждому типу
+        splittersWithoutConnector[splitter.type] += 1;
+      } else {
+        // Сплиттеры с коннектором, считаем общее количество
+        totalSplittersWithConnector += 1;
+      }
+    });
+
+    const splitterWorksItems: WorkItem[] = [];
+    Object.entries(splittersWithoutConnector).forEach(([type, count]) => {
+      if (count > 0) {
+        splitterWorksItems.push({
+          id: `splitter-no-conn-${type}`,
+          name: `Монтаж сплиттера ${type} (без коннектора)`,
+          quantity: count,
+          unit: 'шт.'
+        });
+      }
+    });
+    if (totalSplittersWithConnector > 0) {
+      splitterWorksItems.push({
+        id: 'splitter-with-conn-total',
+        name: 'Монтаж сплиттера (с коннектором)',
+        quantity: totalSplittersWithConnector,
+        unit: 'шт.'
+      });
+    }
+    categories.push({ id: 'splitter-works', name: 'Работы по сплиттерам', items: aggregateWorkItems(splitterWorksItems) });
+
+    // 3. Работы по кабелю (ОБНОВЛЕНО: детализация по видам работ и приоритет факт/проект)
+    const projectedCables = cables.filter(cable => cable.status === 'projected');
+
+    // Карта для хранения суммарных длин по марке кабеля и типу работы
+    const cableModelWorkBreakdown = new Map<string, Record<string, number>>(); // Map<model, Map<workTypeLabel, totalLength>>
+
+    projectedCables.forEach(cable => {
+      const model = cable.model;
+      if (!cableModelWorkBreakdown.has(model)) {
+        cableModelWorkBreakdown.set(model, {});
+      }
+      const modelBreakdown = cableModelWorkBreakdown.get(model)!;
+
+      Object.keys(WORK_TYPE_LABELS).forEach(key => {
+        const label = WORK_TYPE_LABELS[key as keyof typeof WORK_TYPE_LABELS];
+        
+        let workLengthForType = 0;
+
+        // Приоритет: фактическая длина для данного типа работы, если есть и больше 0
+        const actualWorkKey = key as keyof Cable; // Например: 'actualWorkMetConst'
+        if (typeof cable[actualWorkKey] === 'number' && (cable[actualWorkKey] as number) > 0) {
+          workLengthForType = cable[actualWorkKey] as number;
+        } else {
+          // Иначе используем проектную длину (которая включает специфичные множители)
+          workLengthForType = calculateProjectedTotal(cable.id, label);
+        }
+
+        if (workLengthForType > 0) {
+          modelBreakdown[label] = (modelBreakdown[label] || 0) + workLengthForType;
+        }
+      });
+    });
+
+    const cableWorksItems: WorkItem[] = [];
+    cableModelWorkBreakdown.forEach((breakdown, model) => {
+      let totalLengthForModel = 0;
+      const breakdownParts: string[] = [];
+
+      Object.entries(breakdown)
+        .filter(([, quantity]) => quantity > 0) // Фильтруем нулевые значения
+        .forEach(([workType, quantity]) => {
+          totalLengthForModel += quantity;
+          breakdownParts.push(`${workType}: ${quantity.toFixed(1)} м`);
+        });
+
+      const name = `Прокладка кабеля (${model}), общая длина: ${totalLengthForModel.toFixed(1)} м` +
+                   (breakdownParts.length > 0 ? ` (из них: ${breakdownParts.join(', ')})` : '');
+      
+      if (totalLengthForModel > 0) { // Добавляем только если есть общая длина
+        cableWorksItems.push({
+          id: `cable-work-summary-${model}`, // Уникальный ID для агрегированной строки
+          name: name,
+          quantity: totalLengthForModel, // Общее количество для этой строки
+          unit: 'м'
+        });
+      }
+    });
+
+    // Применяем aggregateWorkItems, хотя для детальных кабельных работ это может не изменить список,
+    // так как 'name' уже будет уникальным для каждой модели с её разбивкой.
+    categories.push({ id: 'cable-works', name: 'Работы по кабелю', items: aggregateWorkItems(cableWorksItems) });
+
+    return categories;
+  };
+
+  // КОМПОНЕНТ ДЛЯ ОТОБРАЖЕНИЯ СПЕЦИФИКАЦИИ РАБОТ
+  const WorksSpecification = () => {
+    const works = calculateWorks();
+
+    return (
+      <div style={{ padding: '20px', overflowY: 'auto', flex: 1 }}> {/* Добавляем overflowY и flex: 1 */}
+        <h2 style={{ marginBottom: '20px' }}>Спецификация работ</h2>
+        
+        {works.map(category => (
+          <div key={category.id} style={{ marginBottom: '30px' }}>
+            <h3 style={{ 
+              backgroundColor: '#094961', 
+              color: 'white', 
+              padding: '10px',
+              marginBottom: '15px',
+              borderRadius: '4px'
+            }}>
+              {category.name}
+            </h3>
+            
+            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+              <thead>
+                <tr style={{ backgroundColor: '#f5f5f5' }}>
+                  <th style={{ padding: '10px', textAlign: 'left', borderBottom: '2px solid #ddd' }}>Наименование работы</th>
+                  <th style={{ padding: '10px', textAlign: 'right', borderBottom: '2px solid #ddd', width: '120px' }}>Количество</th>
+                  <th style={{ padding: '10px', textAlign: 'left', borderBottom: '2px solid #ddd', width: '80px' }}>Ед. изм.</th>
+                </tr>
+              </thead>
+              <tbody>
+                {category.items.map(item => (
+                  <tr key={item.id} style={{ borderBottom: '1px solid #eee' }}>
+                    <td style={{ padding: '10px' }}>{item.name}</td>
+                    {/* Форматируем метры до одного знака после запятой, остальные числа без десятичных */}
+                    <td style={{ padding: '10px', textAlign: 'right' }}>{item.unit === 'м' ? item.quantity.toFixed(1) : item.quantity}</td>
+                    <td style={{ padding: '10px' }}>{item.unit}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  // НОВОЕ СОСТОЯНИЕ: для муфт сращивания
+  const [spliceClosures, setSpliceClosures] = useState<SpliceClosure[]>([]);
+  const [spliceClosuresOpen, setSpliceClosuresOpen] = useState(false);
+
+  function getSpliceClosureIcon(number: string, status: SpliceClosure['status']) {
+    const backgroundColor = status === 'existing' ? '#28a745' : '#ffc107';
+    const borderColor = status === 'existing' ? '#1e7e34' : '#e0a800';
+    
+    return new DivIcon({
+      className: '',
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
+      html: `
+        <div style="
+          width: 30px;
+          height: 30px;
+          background-color: ${backgroundColor};
+          border: 3px solid ${borderColor};
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 10px;
+          font-weight: bold;
+          color: white;
+          text-shadow: 1px 1px 1px rgba(0,0,0,0.5);
+          cursor: pointer;
+          box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        ">
+          ${number}
+        </div>
+      `
+    });
+  }
+
+  // НОВЫЕ СОСТОЯНИЯ: для добавления муфт
+  const [addSpliceClosureMode, setAddSpliceClosureMode] = useState(false);
+  const [newSpliceClosurePosition, setNewSpliceClosurePosition] = useState<[number, number] | null>(null);
+  const [spliceClosureParams, setSpliceClosureParams] = useState({ number: "", address: "", place: "" });
+
+  // Добавляем новые функции здесь
+  const handleMapClickSpliceClosure = (position: [number, number]) => {
+    if (addSpliceClosureMode) {
+      setNewSpliceClosurePosition(position);
+      setSpliceClosureParams({ number: "", address: "", place: "" });
+    }
+  };
+
+  const handleSpliceClosureClick = (spliceClosureId: number, position: [number, number]) => {
+    if (addCableMode) {
+      if (!cableStart) {
+        setCableStart({ elementId: spliceClosureId, elementType: 'spliceClosure', position });
+        setCablePoints([position]);
+        setCableEnd(null);
+      } else if (!cableEnd && spliceClosureId !== cableStart.elementId) {
+        setCablePoints(points => [...points, position]);
+        setCableEnd({ elementId: spliceClosureId, elementType: 'spliceClosure', position });
+        setShowCableParamsModal(true);
+        setNewCableParams({ fiberCount: 12, layingType: 'подвес' });
+      }
+    } else {
+      setSelectedElement({ type: 'spliceClosure', id: spliceClosureId });
+    }
+  };
+
+  // НОВАЯ ФУНКЦИЯ: сохранение муфты
+  const handleSaveSpliceClosure = () => {
+    if (!newSpliceClosurePosition) {
+      return;
+    }
+
+    const newSpliceClosure: SpliceClosure = {
+      id: Date.now(), // Уникальный ID
+      position: newSpliceClosurePosition,
+      number: spliceClosureParams.number,
+      address: spliceClosureParams.address,
+      place: spliceClosureParams.place,
+      connections: {
+        input: null,
+        outputs: []
+      },
+      splitters: [],
+      internalFiberConnections: [],
+      status: 'projected', // По умолчанию проектируемая
+      oltTerminalNo: '',
+      oltPortNo: '',
+      model: 'FOSC-A4-S12' // По умолчанию
+    };
+
+    setSpliceClosures(prev => [...prev, newSpliceClosure]);
+    
+    // Сброс состояния
+    setNewSpliceClosurePosition(null);
+    setAddSpliceClosureMode(false);
+    setSpliceClosureParams({ number: "", address: "", place: "" });
+  };
+
+  // НОВАЯ ФУНКЦИЯ: выбор муфты
+  const handleSelectSpliceClosure = (spliceClosureId: number) => {
+    setSelectedElement({ type: 'spliceClosure', id: spliceClosureId });
+  };
+
+  // Добавить новый компонент для отображения деталей муфты
+  function SpliceClosureDetailDialog({
+    spliceClosure,
+    onClose,
+    cables,
+    spliceClosures,
+    fiberConnections,
+    selectedConnectionPoint,
+    onConnectionPointClick,
+    onRemoveFiberConnection,
+    style,
+    onUpdateSpliceClosureSplitters,
+    onUpdateSpliceClosureInternalConnections,
+  }: {
+    spliceClosure: SpliceClosure | null;
+    onClose: () => void;
+    cables: Cable[];
+    spliceClosures: SpliceClosure[];
+    fiberConnections: InternalConnection[];
+    selectedConnectionPoint: ConnectionPoint | null;
+    onConnectionPointClick: (point: ConnectionPoint) => void;
+    onRemoveFiberConnection: (idx: number) => void;
+    style?: React.CSSProperties;
+    onUpdateSpliceClosureSplitters: (spliceClosureId: number, newSplitters: Splitter[]) => void;
+    onUpdateSpliceClosureInternalConnections: (spliceClosureId: number, newConnections: InternalConnection[]) => void;
+  }) {
+    // Этот компонент будет полностью аналогичен CableDetailDialog, но для муфт
+    // Пока оставим заглушку
+    if (!spliceClosure) return null;
+
+    return (
+      <div style={{
+        position: 'fixed',
+        top: '50%',
+        left: '50%',
+        transform: 'translate(-50%, -50%)',
+        backgroundColor: 'white',
+        border: '2px solid #ccc',
+        borderRadius: '8px',
+        padding: '20px',
+        maxWidth: '90vw',
+        maxHeight: '90vh',
+        overflow: 'auto',
+        zIndex: 1000,
+        ...style
+      }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+          <h2>Детали муфты {spliceClosure.number}</h2>
+          <button onClick={onClose} style={{ padding: '5px 10px', cursor: 'pointer' }}>✕</button>
+        </div>
+        
+        <div>
+          <p><strong>Адрес:</strong> {spliceClosure.address}</p>
+          <p><strong>Место установки:</strong> {spliceClosure.place}</p>
+          <p><strong>Модель:</strong> {spliceClosure.model}</p>
+          <p><strong>Статус:</strong> {spliceClosure.status === 'existing' ? 'Существующий' : 'Проектируемый'}</p>
+          <p><strong>OLT Терминал:</strong> {spliceClosure.oltTerminalNo}</p>
+          <p><strong>OLT Порт:</strong> {spliceClosure.oltPortNo}</p>
+        </div>
+        
+        <p style={{ marginTop: '20px', color: '#666' }}>
+          Детальное отображение сплиттеров и соединений будет добавлено позже
+        </p>
+      </div>
+    );
+  }
+
+  // Добавить состояние для отображения деталей муфты
+  const [showSpliceClosureDetails, setShowSpliceClosureDetails] = useState(false);
+
+  // Добавить функции для обновления сплиттеров и соединений муфты
+  const handleUpdateSpliceClosureSplitters = (spliceClosureId: number, newSplitters: Splitter[]) => {
+    setSpliceClosures(prev => prev.map(sc => 
+      sc.id === spliceClosureId ? { ...sc, splitters: newSplitters } : sc
+    ));
+  };
+
+  const handleUpdateSpliceClosureInternalConnections = (spliceClosureId: number, newConnections: InternalConnection[]) => {
+    setSpliceClosures(prev => prev.map(sc => 
+      sc.id === spliceClosureId ? { ...sc, internalFiberConnections: newConnections } : sc
+    ));
+  };
+
+  // Добавить обработчик двойного клика для открытия детального диалога
+  const handleSpliceClosureDblClick = (spliceClosureId: number) => {
+    setSelectedElement({ type: 'spliceClosure', id: spliceClosureId });
+    setShowSpliceClosureDetails(true);
+  };
+
+  const handleSpliceClosurePropertyChange = (field: keyof SpliceClosure, value: any) => {
+    if (selectedElement?.type === 'spliceClosure') {
+        const id = selectedElement.id;
+        setSpliceClosures(prev => prev.map(sc => 
+            sc.id === id ? { ...sc, [field]: value } : sc
+        ));
+    }
+  };
+
+  const handleDeleteSpliceClosure = (spliceClosureId: number) => {
+      if (window.confirm('Вы уверены, что хотите удалить эту муфту? Это действие нельзя будет отменить.')) {
+          const isConnected = cables.some(cable => 
+              (cable.sourceElement.type === 'spliceClosure' && cable.sourceElement.id === spliceClosureId) ||
+              (cable.targetElement?.type === 'spliceClosure' && cable.targetElement?.id === spliceClosureId)
+          );
+
+          if (isConnected) {
+              alert('Нельзя удалить муфту, к которой подключены кабели. Сначала отсоедините или удалите кабели.');
+              return;
+          }
+
+          setSpliceClosures(prev => prev.filter(sc => sc.id !== spliceClosureId));
+          if (selectedElement && selectedElement.type === 'spliceClosure' && selectedElement.id === spliceClosureId) {
+              setSelectedElement(null);
+          }
+      }
+  };
+
+  const toggleAddMode = (mode: 'box' | 'spliceClosure' | 'cable' | 'pole' | 'well') => {
+    const currentlyActive = {
+      box: addBoxMode,
+      spliceClosure: addSpliceClosureMode,
+      cable: addCableMode,
+      pole: addPoleMode,
+      well: addWellMode,
+    };
+
+    setAddBoxMode(false);
+    setAddSpliceClosureMode(false);
+    setAddCableMode(false);
+    setAddPoleMode(false);
+    setAddWellMode(false);
+    setCableStart(null);
+    setCablePoints([]);
+
+    if (!currentlyActive[mode]) {
+      if (mode === 'box') setAddBoxMode(true);
+      if (mode === 'spliceClosure') setAddSpliceClosureMode(true);
+      if (mode === 'cable') setAddCableMode(true);
+      if (mode === 'pole') setAddPoleMode(true);
+      if (mode === 'well') setAddWellMode(true);
+    }
+  };
+
+  return (
+    <div className="App">
+      <Tabs activeTab={activeTab} onTabChange={handleTabChange} tabs={tabs} />
+      <div style={{ display: activeTab === 'situational' ? 'block' : 'none', height: '100vh' }}>
+        <MapContainer center={[46.4825, 30.7233]} zoom={15} style={{ height: "100%", width: "100%" }} zoomControl={false}>
+          <LayersControl position="topright">
+            <LayersControl.BaseLayer checked name="OpenStreetMap">
+              <TileLayer
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+              />
+            </LayersControl.BaseLayer>
+          </LayersControl>
+          <ZoomControl position="bottomright" />
+          <ScaleControl position="bottomleft" />
+
+          <Toolbar
+            toggleAddMode={toggleAddMode}
+            addBoxMode={addBoxMode}
+            addSpliceClosureMode={addSpliceClosureMode}
+            addCableMode={addCableMode}
+            addPoleMode={addPoleMode}
+            addWellMode={addWellMode}
+          />
+          
+          <AddBoxOnMap enabled={addBoxMode} onMapClick={handleMapClick} />
+          <AddSpliceClosureOnMap enabled={addSpliceClosureMode} onMapClick={handleMapClickSpliceClosure} />
+          <AddCableOnMap enabled={addCableMode && !!cableStart && !cableEnd} onMapClick={handleCableMapClick} />
+          <AddPoleOnMap onMapClick={handleMapClickPole} enabled={addPoleMode} />
+          <AddWellOnMap onMapClick={handleMapClickWell} enabled={addWellMode} />
+          
+          {/* НОВЫЙ КОМПОНЕНТ: для добавления муфт */}
+          <AddSpliceClosureOnMap 
+            onMapClick={handleMapClickSpliceClosure} 
+            enabled={addSpliceClosureMode} 
+          />
+
+          <LayersControl position="topleft">
+            <LayersControl.BaseLayer name="OpenStreetMap" checked>
+              <TileLayer
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                maxZoom={19}
+              />
+            </LayersControl.BaseLayer>
+            <LayersControl.BaseLayer name="Google Satellite" checked={false}>
+              <TileLayer
+                attribution='&copy; <a href="https://www.google.com/maps">Google Maps</a>'
+                url="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"
+                maxZoom={20}
+              />
+            </LayersControl.BaseLayer>
+            <LayersControl.Overlay name="Кабели" checked>
+              <LayerGroup>
+                {/* Существующие кабели */}
+                {cables.map(cable => (
+                  <React.Fragment key={cable.id}>
+                    <Polyline
+                      key={cable.id + '-' + cable.fiberCount + '-' + cable.layingType}
+                      positions={cable.points as LatLngExpression[]}
+                      color={
+                        cable.fiberCount === 4 ? "#000"
+                        : cable.fiberCount === 8 ? "#ff0000"
+                        : cable.fiberCount === 12 ? "#00b050"
+                        : cable.fiberCount === 24 ? "#0070c0"
+                        : cable.fiberCount === 48 ? "#ff9900"
+                        : cable.fiberCount === 96 ? "#703000"
+                        : cable.fiberCount === 144 ? "#7030a0"
+                        : "green"
+                      }
+                      dashArray={cable.layingType === "канализация" ? "6 6" : undefined}
+                      weight={4}
+                      eventHandlers={{ click: () => handleSelectCable(cable.id) }}
+                    >
+                      {cable.points.length > 1 && (
+                        <Tooltip
+                          position={getPolylineMiddlePoint(cable.points)}
+                          direction="top"
+                          offset={[0, -10]}
+                          permanent
+                          opacity={0.85}
+                          interactive={false}
+                        >
+                          <span style={{ fontSize: 13, fontWeight: 600 }}>
+                            {getDisplayCableLength(cable)} {/* ИСПОЛЬЗУЕМ НОВУЮ ФУНКЦИЮ */}
+                          </span>
+                        </Tooltip>
+                      )}
+                    </Polyline>
+                    {/* Drag-ручки на промежуточных точках (кроме концов) для выбранного кабеля */}
+                    {selectedElement?.type === 'cable' && selectedElement.id === cable.id && cable.points.slice(1, -1).map((pt, idx) => (
+                      <Marker
+                        key={idx}
+                        position={pt}
+                        icon={getCablePointIcon(false)}
+                        draggable={true}
+                        eventHandlers={{
+                          dragend: (e) => handleCablePointDragEnd(cable.id, idx + 1, e as DragEndEvent)
+                        }}
+                      />
+                    ))}
+                  </React.Fragment>
+                ))}
+                {/* Строящийся кабель */}
+                {addCableMode && cableStart && cablePoints.length > 0 && (
+                  <Polyline
+                    positions={cablePoints as LatLngExpression[]}
+                    color="orange"
+                    dashArray="6 6"
+                    weight={4}
+                  />
+                )}
+              </LayerGroup>
+            </LayersControl.Overlay>
+            <LayersControl.Overlay name="Боксы" checked>
+              <LayerGroup>
+                {boxes.map((box) => {
+                  let label = box.number; // По умолчанию - номер бокса
+                  
+                  // Ищем сплиттер 3-го уровня
+                  const splitterL3 = box.splitters.find(s => s.level === 3);
+                  if (splitterL3) {
+                    label = splitterL3.type;
+                  } else {
+                    // Если нет, ищем сплиттер 2-го уровня
+                    const splitterL2 = box.splitters.find(s => s.level === 2);
+                    if (splitterL2) {
+                      label = splitterL2.type;
+                    }
+                  }
+
+                  return (
+                    <React.Fragment key={box.id}>
+                      <Marker
+                        position={box.position}
+                        icon={getBoxIcon(label, box.status)}
+                        draggable={true}
+                        eventHandlers={{
+                          dblclick: () => {
+                            handleMarkerDblClick(box.id);
+                          },
+                          dragend: (e) => handleMarkerDragEnd(box.id, 'box', e as DragEndEvent),
+                          click: () => {
+                            if (addCableMode) {
+                              handleBoxClick(box.id, box.position);
+                            } else {
+                              if (clickTimeoutRef.current) clearTimeout(clickTimeoutRef.current);
+                              clickTimeoutRef.current = setTimeout(() => {
+                                handleSelectBox(box.id);
+                                clickTimeoutRef.current = null;
+                              }, 200);
+                            }
+                          }
+                        }}
+                      />
+                    </React.Fragment>
+                  );
+                })}
+              </LayerGroup>
+            </LayersControl.Overlay>
+            <LayersControl.Overlay name="Опоры" checked>
+              <LayerGroup>
+                {poles.map(pole => (
+                  <React.Fragment key={pole.id}>
+                    <Marker
+                      position={pole.position}
+                      icon={getPoleIcon(pole.purpose)}
+                      draggable={true}
+                      eventHandlers={{
+                        dragend: (e) => {
+                          const { lat, lng } = (e.target as L.Marker).getLatLng();
+                          setPoles(poles => poles.map(p =>
+                            p.id === pole.id ? { ...p, position: [lat, lng] } : p
+                          ));
+                        },
+                        click: () => handleSelectPole(pole.id)
+                      }}
+                    />
+                    {/* Подпись с номером опоры */}
+                    <Marker
+                      position={[pole.position[0] + pole.labelOffset[0] * 0.00001, pole.position[1] + pole.labelOffset[1] * 0.00001]}
+                      icon={new DivIcon({
+                        className: '',
+                        iconSize: [40, 20],
+                        iconAnchor: [20, 10],
+                        html: `<div style="font-size:15px;font-weight:bold;color:#222;cursor:move;">${pole.number || ''}</div>`
+                      })}
+                      draggable={true}
+                      eventHandlers={{
+                        dragstart: (e) => {
+                          const orig = (e as any).originalEvent;
+                          if (orig && typeof orig.clientX === 'number' && typeof orig.clientY === 'number') {
+                            handleLabelDragStart(pole.id, orig);
+                          }
+                        },
+                        dragend: (e) => handleLabelDragEnd(),
+                        click: () => handleSelectPole(pole.id)
+                      }}
+                    />
+                  </React.Fragment>
+                ))}
+              </LayerGroup>
+            </LayersControl.Overlay>
+            <LayersControl.Overlay name="Колодцы" checked>
+              <LayerGroup>
+                {wells.map(well => (
+                  <React.Fragment key={well.id}>
+                    <Marker
+                      position={well.position}
+                      icon={getWellIcon()}
+                      draggable={true}
+                      eventHandlers={{
+                        dragend: (e) => {
+                          const { lat, lng } = (e.target as L.Marker).getLatLng();
+                          setWells(wells => wells.map(w =>
+                            w.id === well.id ? { ...w, position: [lat, lng] } : w
+                          ));
+                        },
+                        click: () => handleSelectWell(well.id)
+                      }}
+                    />
+                    {/* Подпись с номером колодца */}
+                    <Marker
+                      position={[well.position[0] + well.labelOffset[0] * 0.00001, well.position[1] + well.labelOffset[1] * 0.00001]}
+                      icon={new DivIcon({
+                        className: '',
+                        iconSize: [40, 20],
+                        iconAnchor: [20, 10],
+                        html: `<div style="font-size:15px;font-weight:bold;color:#222;cursor:move;">${well.number || ''}</div>`
+                      })}
+                      draggable={true}
+                      eventHandlers={{
+                        dragstart: (e) => {
+                          const orig = (e as any).originalEvent;
+                          if (orig && typeof orig.clientX === 'number' && typeof orig.clientY === 'number') {
+                            setDraggedLabelPoleId(well.id);
+                            setLabelDragOffset([orig.clientX, orig.clientY]);
+                          }
+                        },
+                        dragend: (e) => handleLabelDragEnd(),
+                        click: () => handleSelectWell(well.id)
+                      }}
+                    />
+                  </React.Fragment>
+                ))}
+              </LayerGroup>
+            </LayersControl.Overlay>
+            
+            {/* НОВЫЙ СЛОЙ: Муфты */}
+            <LayersControl.Overlay name="Муфты" checked>
+              <LayerGroup>
+                {spliceClosures.map(spliceClosure => (
+                  <Marker
+                    key={spliceClosure.id}
+                    position={spliceClosure.position}
+                    icon={getSpliceClosureIcon(spliceClosure.number, spliceClosure.status)}
+                    draggable={true}
+                    eventHandlers={{
+                      click: (e) => handleSpliceClosureClick(spliceClosure.id, spliceClosure.position),
+                      dblclick: () => handleSpliceClosureDblClick(spliceClosure.id), // Добавить двойной клик
+                      dragend: (e) => handleMarkerDragEnd(spliceClosure.id, 'spliceClosure', e)
+                    }}
+                  />
+                ))}
+              </LayerGroup>
+            </LayersControl.Overlay>
+          </LayersControl>
+        </MapContainer>
+      </div>
+
+      {/* === Область свойств справа === */}
+      {openedBoxId === null && activeTab === 'situational' && ( // Добавляем условие activeTab
+        <div style={{
+          width: 340, // Задаем фиксированную ширину
+          background: '#f8f8f8', // Фон как у левой панели
+          borderLeft: '1px solid #ddd', // Граница слева
+          padding: 18,
+          overflowY: 'auto', // Скролл, если контент не помещается
+          flexShrink: 0 // Запрещаем панели сжиматься
+          // Удалены: position, right, top, boxShadow, borderRadius, zIndex
+        }}>
+          {selectedElement === null && (
+            <div style={{ color: '#888', fontSize: 15, textAlign: 'center', marginTop: 40 }}>
+              Выберите элемент на карте
+            </div>
+          )}
+          {selectedElement?.type === 'box' && (() => {
+            const box = boxes.find(b => b.id === selectedElement.id);
+            if (!box) return null;
+            return (
+              <>
+                <div style={{ marginBottom: 15 }}>
+                  <h3 style={{ margin: '0 0 10px 0', textAlign: 'center' }}>Свойства бокса</h3>
+                  {/* Обновленный стиль для каждого поля */}
+                  {/* Применяем flexbox для каждой строки свойств */}
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Состояние:</label>
+                    <select
+                      value={box.status}
+                      onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, status: e.target.value as Box['status'] } : b))}
+                      style={{ flexGrow: 1 }}
+                    >
+                      <option value="projected">Проектируемый</option>
+                      <option value="existing">Существующий</option>
+                    </select>
+                </div>
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Номер бокса:</label>
+                    <input value={box.number} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, number: e.target.value } : b))} style={{ flexGrow: 1 }} />
+                </div>
+                {/* НОВОЕ ПОЛЕ: Модель бокса */}
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Модель бокса:</label>
+                    <select
+                      value={box.model}
+                      onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, model: e.target.value as Box['model'] } : b))}
+                      style={{ flexGrow: 1 }}
+                    >
+                      <option value="FOB-02-04-04LC">FOB-02-04-04LC</option>
+                      <option value="FOB-03-12-08LC">FOB-03-12-08LC</option>
+                      <option value="FOB-04-16-16LC">FOB-04-16-16LC</option>
+                      <option value="FOB-05-24-24LC">FOB-05-24-24LC</option>
+                      <option value="FOB-02-04-04SC">FOB-02-04-04SC</option>
+                      <option value="FOB-03-12-08SC">FOB-03-12-08SC</option>
+                      <option value="FOB-04-16-16SC">FOB-04-16-16SC</option>
+                      <option value="FOB-05-24-24SC">FOB-05-24-24SC</option>
+                      <option value="FOB-05-24">FOB-05-24</option>
+                    </select>
+                </div>
+                {/* НОВЫЕ ПОЛЯ: № терминала (OLT) и № порта (OLT Port) */}
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>№ терминала (OLT):</label>
+                    <input value={box.oltTerminalNo} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, oltTerminalNo: e.target.value } : b))} style={{ flexGrow: 1 }} />
+                </div>
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>№ порта (OLT Port):</label>
+                    <input value={box.oltPortNo} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, oltPortNo: e.target.value } : b))} style={{ flexGrow: 1 }} />
+                </div>
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Адрес:</label>
+                    <input value={box.address} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, address: e.target.value } : b))} style={{ flexGrow: 1 }} />
+                </div>
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Место установки:</label>
+                    <input value={box.place} onChange={e => setBoxes(boxes => boxes.map(b => b.id === box.id ? { ...b, place: e.target.value } : b))} style={{ flexGrow: 1 }} />
+                </div>
+                {/* РАЗДЕЛЕННЫЕ ПОЛЯ: Координаты */}
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Широта:</label>
+                    <input value={box.position[0].toFixed(6)} readOnly style={{ flexGrow: 1, color: '#888' }} />
+                </div>
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '130px', textAlign: 'right', marginRight: '10px' }}>Долгота:</label>
+                    <input value={box.position[1].toFixed(6)} readOnly style={{ flexGrow: 1, color: '#888' }} />
+                </div>
+
+                {/* НОВАЯ СЕКЦИЯ: Список сплиттеров в боксе */}
+                {box.splitters.length > 0 && (
+                  <div style={{ marginTop: 20, borderTop: '1px dashed #eee', paddingTop: 15 }}>
+                    <h4 style={{ marginTop: 0, marginBottom: 10 }}>Установленные сплиттеры:</h4>
+                    {box.splitters.map((splitter, idx) => (
+                      <div key={splitter.id} style={{ marginBottom: 8, fontSize: '13px', lineHeight: '1.4' }}>
+                          <strong>Сплиттер {idx + 1}:</strong> Уровень {splitter.level}, Номер: {splitter.number || 'не задан'}, {splitter.connectorType || 'Без коннектора'}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                </div>
+                {/* НОВАЯ КНОПКА: Удалить бокс */}
+                <button
+                  onClick={() => handleDeleteBox(box.id)}
+                  style={{
+                    background: '#dc3545',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    padding: '8px 16px',
+                    cursor: 'pointer',
+                    marginTop: '20px', // Добавляем отступ сверху
+                    width: '100%'
+                  }}
+                >
+                  Удалить бокс
+                </button>
+              </>
+            );
+          })()}
+          {selectedElement?.type === 'cable' && (() => {
+            const cable = cables.find(c => c.id === selectedElement.id);
+            if (!cable) return null;
+            return (
+              <>
+                <div style={{ marginBottom: 15 }}>
+                  <h3 style={{ margin: '0 0 10px 0', textAlign: 'center' }}>Свойства кабеля</h3>
+                  
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Состояние:</label>
+                    <select
+                      value={cable.status}
+                      onChange={e => setCables(cables => cables.map(c => 
+                        c.id === cable.id ? { ...c, status: e.target.value as Cable['status'] } : c
+                      ))}
+                      style={{ flexGrow: 1 }}
+                    >
+                      <option value="projected">Проектируемый</option>
+                      <option value="existing">Существующий</option>
+                    </select>
+                  </div>
+
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Количество волокон:</label>
+                    <select
+                      value={cable.fiberCount}
+                      onChange={e => {
+                        const newFiberCount = parseInt(e.target.value);
+                        const defaultModel = CABLE_MODELS[newFiberCount]?.[0] || '';
+                        setCables(cables => cables.map(c =>
+                          c.id === cable.id ? { ...c, fiberCount: newFiberCount, model: defaultModel } : c
+                        ));
+                      }}
+                      style={{ flexGrow: 1 }}
+                    >
+                      <option value="4">4</option>
+                      <option value="8">8</option>
+                      <option value="12">12</option>
+                      <option value="24">24</option>
+                      <option value="48">48</option>
+                      <option value="96">96</option>
+                      <option value="144">144</option>
+                    </select>
+                </div>
+
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Марка кабеля:</label>
+                    <select
+                      value={cable.model || ''}
+                      onChange={e => setCables(cables => cables.map(c => 
+                        c.id === cable.id ? { ...c, model: e.target.value } : c
+                      ))}
+                      style={{ flexGrow: 1 }}
+                    >
+                      <option value="">Выберите марку</option>
+                      {CABLE_MODELS[cable.fiberCount]?.map(model => (
+                        <option key={model} value={model}>{model}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Тип прокладки:</label>
+                    <select
+                      value={cable.layingType}
+                      onChange={e => setCables(cables => cables.map(c => 
+                        c.id === cable.id ? { ...c, layingType: e.target.value as Cable['layingType'] } : c
+                      ))}
+                      style={{ flexGrow: 1 }}
+                    >
+                      <option value="подвес">Подвес</option>
+                      <option value="канализация">Канализация</option>
+                    </select>
+                </div>
+
+                  {/* НОВОЕ ПОЛЕ: № терминала (OLT) */}
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>№ терминала (OLT):</label>
+                    <input
+                      type="text"
+                      value={cable.oltTerminalNo || ''}
+                      onChange={e => setCables(cables => cables.map(c => 
+                        c.id === cable.id ? { ...c, oltTerminalNo: e.target.value } : c
+                      ))}
+                      style={{ flexGrow: 1 }}
+                    />
+                </div>
+
+                  {/* НОВОЕ ПОЛЕ: № порта (OLT Port) */}
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>№ порта (OLT Port):</label>
+                    <input
+                      type="text"
+                      value={cable.oltPortNo || ''}
+                      onChange={e => setCables(cables => cables.map(c => 
+                        c.id === cable.id ? { ...c, oltPortNo: e.target.value } : c
+                      ))}
+                      style={{ flexGrow: 1 }}
+                    />
+                </div>
+
+                  <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                    <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Длина трассы:</label>
+                    <input 
+                      value={`${calculateCableLength(cable.points).toFixed(2)} м`}
+                      readOnly
+                      style={{ flexGrow: 1, color: '#888' }}
+                    />
+                  </div>
+                </div>
+
+                {/* НОВЫЙ РАЗДЕЛ: Работы по кабелю (проектные расчеты) */}
+                <div style={{
+                  marginTop: 20,
+                  borderTop: '1px dashed #eee',
+                  paddingTop: 15,
+                  marginBottom: 15
+                }}>
+                  {/* ОБНОВЛЕННЫЙ БЛОК: Заголовок для списка проектных работ и кнопка сворачивания */}
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    marginBottom: '10px',
+                    justifyContent: 'center',
+                  }}>
+                    <h4
+                      style={{
+                        margin: '0',
+                        cursor: 'pointer',
+                        width: '100%',
+                      }}
+                      onClick={() => setShowProjectedWorks(!showProjectedWorks)} // Добавляем обработчик клика
+                    >
+                      Работы по кабелю (проект) {showProjectedWorks ? '▼' : '►'} {/* Индикатор */}
+                    </h4>
+                  </div>
+
+                  {/* Условное отображение полей проектных работ */}
+                  {showProjectedWorks && (
+                    <>
+                      {/* НОВОЕ ПОЛЕ: Длина (проект) - вычисляемое */}
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Длина (проект):</label>
+                        <input
+                          type="text"
+                          value={`${Object.keys(WORK_TYPE_LABELS).reduce((sum, key) => {
+                              const label = WORK_TYPE_LABELS[key as keyof typeof WORK_TYPE_LABELS];
+                              return sum + calculateProjectedTotal(cable.id, label);
+                          }, 0).toFixed(2)} м`}
+                          readOnly
+                          style={{ flexGrow: 1, color: '#888', fontWeight: 'bold' }}
+                        />
+                      </div>
+
+                      {Object.keys(WORK_TYPE_LABELS).map((key) => {
+                        const label = WORK_TYPE_LABELS[key as keyof typeof WORK_TYPE_LABELS];
+                        const currentProjectedWork = projectedCableWork[cable.id]?.[label];
+                        const totalProjected = currentProjectedWork ? calculateProjectedTotal(cable.id, label) : null;
+
+                        return (
+                          <div key={key} style={{ marginBottom: 15, border: '1px solid #eee', padding: 10, borderRadius: 5 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 5 }}>
+                              <label
+                                style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px', cursor: 'pointer' }}
+                                onClick={() => handleToggleProjectedWorkDetails(cable.id, label)}
+                              >
+                                {label}: {currentProjectedWork?.showDetails ? '▼' : '►'}
+                              </label>
+                              <input
+                                type="text"
+                                value={totalProjected !== null ? totalProjected.toFixed(2) + ' м' : '0.00 м'}
+                                readOnly
+                                style={{ flexGrow: 1, color: '#888', fontWeight: 'bold' }}
+                              />
+                              <button
+                                onClick={() => handleAddProjectedSection(cable.id, label)}
+                                style={{ marginLeft: '10px', padding: '5px 8px', cursor: 'pointer', minWidth: '30px' }}
+                              >
+                                +
+                              </button>
+                            </div>
+
+                            {currentProjectedWork && currentProjectedWork.showDetails && (
+                              <>
+                                <div style={{ display: 'flex', alignItems: 'center', marginBottom: 5, marginLeft: '10px' }}>
+                                  <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Запас:</label>
+                                  <input
+                                    type="number"
+                                    value={currentProjectedWork.reserve}
+                                    onChange={e => handleUpdateProjectedReserve(cable.id, label, parseFloat(e.target.value) || 0)}
+                                    style={{ flexGrow: 1 }}
+                                  />
+                                  <button
+                                    onClick={() => handleRemoveProjectedReserve(cable.id, label)}
+                                    style={{ marginLeft: '10px', padding: '5px 8px', cursor: 'pointer', background: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', minWidth: '30px' }}
+                                  >
+                                    -
+                                  </button>
+                                </div>
+
+                                {currentProjectedWork.sections.map((sectionVal, idx) => (
+                                  <div key={idx} style={{ display: 'flex', alignItems: 'center', marginBottom: 5, marginLeft: '10px' }}>
+                                    <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Участок {idx + 1}:</label>
+                                    <input
+                                      type="number"
+                                      value={sectionVal}
+                                      onChange={e => handleUpdateProjectedSection(cable.id, label, idx, parseFloat(e.target.value) || 0)}
+                                      style={{ flexGrow: 1 }}
+                                    />
+                                    <button
+                                      onClick={() => handleRemoveProjectedSection(cable.id, label, idx)}
+                                      style={{ marginLeft: '10px', padding: '5px 8px', cursor: 'pointer', background: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', minWidth: '30px' }}
+                                    >
+                                      -
+                                    </button>
+                                  </div>
+                                ))}
+
+                                <div style={{ display: 'flex', alignItems: 'center', marginBottom: 5, marginLeft: '10px' }}>
+                                    <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Добавить участок:</label>
+                                    <button
+                                        onClick={() => handleAddProjectedSection(cable.id, label)}
+                                        style={{ marginLeft: '10px', padding: '5px 8px', cursor: 'pointer', minWidth: '30px' }}
+                                    >
+                                        +
+                                    </button>
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </>
+                  )}
+                </div>
+
+                {/* НОВЫЙ РАЗДЕЛ: Работы по кабелю */}
+                <div style={{
+                  marginTop: 20,
+                  borderTop: '1px dashed #eee',
+                  paddingTop: 15,
+                  marginBottom: 15 // Добавляем отступ снизу для секции
+                }}>
+                  {/* ОБНОВЛЕННЫЙ БЛОК: Заголовок для списка фактических работ и кнопка сворачивания */}
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    marginBottom: '10px', // Немного уменьшил отступ
+                    justifyContent: 'center', // Центрируем содержимое заголовка
+                  }}>
+                    <h4 
+                      style={{ 
+                        margin: '0', 
+                        cursor: 'pointer', 
+                        width: '100%', // Убедимся, что h4 занимает всю ширину для кликабельности
+                      }} 
+                      onClick={() => setShowActualWorks(!showActualWorks)}
+                    >
+                      Работы по кабелю (факт) {showActualWorks ? '▼' : '►'}
+                    </h4>
+                  </div>
+                  
+                  {/* Условное отображение полей фактических работ */}
+                  {showActualWorks && (
+                    <>
+                      {/* ФАКТИЧЕСКОЕ ПОЛЕ: Длина кабеля (теперь вычисляемое) */}
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Длина (факт):</label>
+                        <input
+                          type="text" // Изменено на text, так как это теперь отображаемое поле с " м"
+                          value={`${((cable.actualWorkMetConst || 0) +
+                                    (cable.actualWorkTK || 0) +
+                                    (cable.actualWorkInGround || 0) +
+                                    (cable.actualWorkExitLKS || 0) +
+                                    (cable.actualWorkSuspension || 0) +
+                                    (cable.actualWorkOnWall || 0) +
+                                    (cable.actualWorkOnRiser || 0)).toFixed(2)} м`}
+                          readOnly // Теперь только для чтения
+                          style={{ flexGrow: 1, color: '#888', fontWeight: 'bold' }} // Добавим bold, чтобы подчеркнуть, что это итоговое значение
+                        />
+                      </div>
+
+                      {/* ФАКТИЧЕСКОЕ ПОЛЕ: Метка А */}
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Метка А:</label>
+                        <input
+                          type="number" // Изменено на number
+                          value={cable.actualMarkA || 0} // Убедитесь, что значение по умолчанию 0, если undefined
+                          onChange={e => setCables(cables => cables.map(c => 
+                            c.id === cable.id ? { ...c, actualMarkA: parseFloat(e.target.value) || 0 } : c
+                          ))}
+                          style={{ flexGrow: 1 }}
+                        />
+                      </div>
+
+                      {/* ФАКТИЧЕСКОЕ ПОЛЕ: Метка Б */}
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>Метка Б:</label>
+                        <input
+                          type="number" // Изменено на number
+                          value={cable.actualMarkB || 0} // Убедитесь, что значение по умолчанию 0, если undefined
+                          onChange={e => setCables(cables => cables.map(c => 
+                            c.id === cable.id ? { ...c, actualMarkB: parseFloat(e.target.value) || 0 } : c
+                          ))}
+                          style={{ flexGrow: 1 }}
+                        />
+                      </div>
+
+                      {/* НОВЫЕ ФАКТИЧЕСКИЕ ПОЛЯ ДЛЯ ВИДОВ РАБОТ */}
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>по мет. конст.:</label>
+                        <input
+                          type="number"
+                          value={cable.actualWorkMetConst || 0}
+                          onChange={e => setCables(cables => cables.map(c => 
+                            c.id === cable.id ? { ...c, actualWorkMetConst: parseFloat(e.target.value) || 0 } : c
+                          ))}
+                          style={{ flexGrow: 1 }}
+                        />
+                      </div>
+
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>по т/к:</label>
+                        <input
+                          type="number"
+                          value={cable.actualWorkTK || 0}
+                          onChange={e => setCables(cables => cables.map(c => 
+                            c.id === cable.id ? { ...c, actualWorkTK: parseFloat(e.target.value) || 0 } : c
+                          ))}
+                          style={{ flexGrow: 1 }}
+                        />
+                      </div>
+
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>в грунте:</label>
+                        <input
+                          type="number"
+                          value={cable.actualWorkInGround || 0}
+                          onChange={e => setCables(cables => cables.map(c => 
+                            c.id === cable.id ? { ...c, actualWorkInGround: parseFloat(e.target.value) || 0 } : c
+                          ))}
+                          style={{ flexGrow: 1 }}
+                        />
+                      </div>
+
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>выход из ЛКС:</label>
+                        <input
+                          type="number"
+                          value={cable.actualWorkExitLKS || 0}
+                          onChange={e => setCables(cables => cables.map(c => 
+                            c.id === cable.id ? { ...c, actualWorkExitLKS: parseFloat(e.target.value) || 0 } : c
+                          ))}
+                          style={{ flexGrow: 1 }}
+                        />
+                      </div>
+
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>подвес:</label>
+                        <input
+                          type="number"
+                          value={cable.actualWorkSuspension || 0}
+                          onChange={e => setCables(cables => cables.map(c => 
+                            c.id === cable.id ? { ...c, actualWorkSuspension: parseFloat(e.target.value) || 0 } : c
+                          ))}
+                          style={{ flexGrow: 1 }}
+                        />
+                      </div>
+
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>по стене:</label>
+                        <input
+                          type="number"
+                          value={cable.actualWorkOnWall || 0}
+                          onChange={e => setCables(cables => cables.map(c => 
+                            c.id === cable.id ? { ...c, actualWorkOnWall: parseFloat(e.target.value) || 0 } : c
+                          ))}
+                          style={{ flexGrow: 1 }}
+                        />
+                      </div>
+
+                      <div style={{ marginBottom: 10, display: 'flex', alignItems: 'center' }}>
+                        <label style={{ flexShrink: 0, width: '90px', textAlign: 'right', marginRight: '10px' }}>по стояку:</label>
+                        <input
+                          type="number"
+                          value={cable.actualWorkOnRiser || 0}
+                          onChange={e => setCables(cables => cables.map(c => 
+                            c.id === cable.id ? { ...c, actualWorkOnRiser: parseFloat(e.target.value) || 0 } : c
+                          ))}
+                          style={{ flexGrow: 1 }}
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* Кнопка "Удалить кабель" */}
+                <button
+                  onClick={() => handleDeleteCable(cable.id)}
+                  style={{
+                    background: '#dc3545',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    padding: '8px 16px',
+                    cursor: 'pointer',
+                    marginTop: '20px',
+                    width: '100%'
+                  }}
+                >
+                  Удалить кабель
+                </button>
+              </>
+            );
+          })()}
+          {selectedElement?.type === 'pole' && (() => {
+            const pole = poles.find(p => p.id === selectedElement.id);
+            if (!pole) return null;
+            return (
+              <>
+                <h3 style={{ marginTop: 0 }}>Свойства опоры</h3>
+                <div style={{ marginBottom: 10 }}>
+                  <label>Номер опоры:<br />
+                    <input value={pole.number} onChange={e => setPoles(poles => poles.map(p => p.id === pole.id ? { ...p, number: e.target.value } : p))} style={{ width: '100%' }} />
+                  </label>
+                </div>
+                <div style={{ marginBottom: 10 }}>
+                  <label>Номер ТП:<br />
+                    <input value={pole.tpNumber} onChange={e => setPoles(poles => poles.map(p => p.id === pole.id ? { ...p, tpNumber: e.target.value } : p))} style={{ width: '100%' }} />
+                  </label>
+                </div>
+                <div style={{ marginBottom: 10 }}>
+                  <label>Назначение:<br />
+                    <select value={pole.purpose} onChange={e => setPoles(poles => poles.map(p => p.id === pole.id ? { ...p, purpose: e.target.value as Pole['purpose'] } : p))} style={{ width: '100%' }}>
+                      <option value="0,4кВт">0,4кВт</option>
+                      <option value="10кВт">10кВт</option>
+                      <option value="УТК">УТК</option>
+                      <option value="Освещение">Освещение</option>
+                    </select>
+                  </label>
+                </div>
+                <div style={{ marginBottom: 10 }}>
+                  <label>Координаты:<br />
+                    <input value={`${pole.position[0].toFixed(6)}, ${pole.position[1].toFixed(6)}`} readOnly style={{ width: '100%', color: '#888' }} />
+                  </label>
+                </div>
+              </>
+            );
+          })()}
+          {selectedElement?.type === 'well' && (() => {
+            const well = wells.find(w => w.id === selectedElement.id);
+            if (!well) return null;
+            return (
+              <>
+                <h3 style={{ marginTop: 0 }}>Свойства колодца</h3>
+                <div style={{ marginBottom: 10 }}>
+                  <label>Номер колодца:<br />
+                    <input value={well.number} onChange={e => setWells(wells => wells.map(w => w.id === well.id ? { ...w, number: e.target.value } : w))} style={{ width: '100%' }} />
+                  </label>
+                </div>
+                <div style={{ marginBottom: 10 }}>
+                  <label>Координаты:<br />
+                    <input value={`${well.position[0].toFixed(6)}, ${well.position[1].toFixed(6)}`} readOnly style={{ width: '100%', color: '#888' }} />
+                  </label>
+                </div>
+              </>
+            );
+          })()}
+{selectedElement?.type === 'spliceClosure' && (() => {
+                const spliceClosure = spliceClosures.find(sc => sc.id === selectedElement.id);
+                if (!spliceClosure) return null;
+
+                const spliceClosureModels: SpliceClosure['model'][] = [
+                  'FOSC-A4-S08', 'FOSC-A4-S12', 'FOSC-A4-S16', 'FOSC-A4-S24', 
+                  'FOSC-A8-S08', 'FOSC-A8-S12', 'FOSC-A8-S24', 'FOSC-B4-S24', 
+                  'FOSC-B8-S24', 'FOSC-C-S12', 'FOSC-AM-04'
+                ];
+
+                return (
+                  <div style={{ padding: '15px' }}>
+                    <h3 style={{ marginTop: 0, marginBottom: '20px', textAlign: 'center' }}>Свойства муфты</h3>
+                    <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr', gap: '10px 15px', alignItems: 'center' }}>
+                      
+                      <label htmlFor="sc-status">Состояние:</label>
+                      <select
+                        id="sc-status"
+                        value={spliceClosure.status}
+                        onChange={(e) => handleSpliceClosurePropertyChange('status', e.target.value)}
+                        style={{ width: '100%', padding: '5px' }}
+                      >
+                        <option value="projected">Проектируемый</option>
+                        <option value="existing">Существующий</option>
+                      </select>
+
+                      <label htmlFor="sc-number">Номер муфты:</label>
+                      <input
+                        id="sc-number"
+                        type="text"
+                        value={spliceClosure.number}
+                        onChange={(e) => handleSpliceClosurePropertyChange('number', e.target.value)}
+                        style={{ width: '100%', padding: '5px' }}
+                      />
+                      
+                      <label htmlFor="sc-model">Модель муфты:</label>
+                      <select
+                          id="sc-model"
+                          value={spliceClosure.model}
+                          onChange={(e) => handleSpliceClosurePropertyChange('model', e.target.value)}
+                          style={{ width: '100%', padding: '5px' }}
+                      >
+                          {spliceClosureModels.map(model => (
+                              <option key={model} value={model}>{model}</option>
+                          ))}
+                      </select>
+
+                      <label htmlFor="sc-olt-terminal">№ терминала (OLT):</label>
+                      <input
+                        id="sc-olt-terminal"
+                        type="text"
+                        value={spliceClosure.oltTerminalNo}
+                        onChange={(e) => handleSpliceClosurePropertyChange('oltTerminalNo', e.target.value)}
+                        style={{ width: '100%', padding: '5px' }}
+                      />
+
+                      <label htmlFor="sc-olt-port">№ порта (OLT Port):</label>
+                      <input
+                        id="sc-olt-port"
+                        type="text"
+                        value={spliceClosure.oltPortNo}
+                        onChange={(e) => handleSpliceClosurePropertyChange('oltPortNo', e.target.value)}
+                        style={{ width: '100%', padding: '5px' }}
+                      />
+
+                      <label htmlFor="sc-address">Адрес:</label>
+                      <input
+                        id="sc-address"
+                        type="text"
+                        value={spliceClosure.address}
+                        onChange={(e) => handleSpliceClosurePropertyChange('address', e.target.value)}
+                        style={{ width: '100%', padding: '5px' }}
+                      />
+
+                      <label htmlFor="sc-place">Место установки:</label>
+                      <input
+                        id="sc-place"
+                        type="text"
+                        value={spliceClosure.place}
+                        onChange={(e) => handleSpliceClosurePropertyChange('place', e.target.value)}
+                        style={{ width: '100%', padding: '5px' }}
+                      />
+
+                      <label>Широта:</label>
+                      <input type="text" value={spliceClosure.position[0].toFixed(6)} readOnly style={{ width: '100%', padding: '5px', backgroundColor: '#eee' }}/>
+                      
+                      <label>Долгота:</label>
+                      <input type="text" value={spliceClosure.position[1].toFixed(6)} readOnly style={{ width: '100%', padding: '5px', backgroundColor: '#eee' }}/>
+                    </div>
+
+                    <div style={{ marginTop: '20px' }}>
+                      <h4 style={{ marginBottom: '10px' }}>Установленные сплиттеры:</h4>
+                      {spliceClosure.splitters.length === 0 ? (
+                        <p style={{color: '#666'}}>Сплиттеры не установлены</p>
+                      ) : (
+                        <ul style={{ listStyle: 'none', paddingLeft: 0, margin: 0 }}>
+                          {spliceClosure.splitters.map((splitter, index) => (
+                            <li key={splitter.id}>
+                              {`Сплиттер ${index + 1}: ${splitter.type}, Номер: ${splitter.number || 'не задан'}`}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                    
+                    <button 
+                      onClick={() => handleDeleteSpliceClosure(spliceClosure.id)}
+                      style={{ width: '100%', padding: '10px', marginTop: '20px', backgroundColor: '#dc3545', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+                    >
+                      Удалить муфту
+                    </button>
+                  </div>
+                );
+              })()}
+        </div>
+      )}
+
+      {/* Форма создания бокса */}
+      {addBoxMode && newBoxPosition && (
+        <div style={{
+          position: 'fixed', // Это правильно, для центрирования по экрану
+          top: '50%',       // Центрируем по вертикали
+          left: '50%',      // Центрируем по горизонтали
+          transform: 'translate(-50%, -50%)', // Точное центрирование по осям X и Y
+          background: 'white',
+          padding: '20px',
+          border: '1px solid #ccc',
+          borderRadius: '4px',
+          boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
+          zIndex: 4000 // Увеличим zIndex, чтобы оно было поверх всего
+        }}>
+          <h3 style={{ marginTop: 0, marginBottom: '15px' }}>Параметры бокса</h3> {/* Добавил заголовок */}
+          <div style={{ marginBottom: '10px' }}>
+            <label>
+              Номер бокса: <input value={boxParams.number} onChange={e => setBoxParams({ ...boxParams, number: e.target.value })} />
+            </label>
+          </div>
+          <div style={{ marginBottom: '10px' }}>
+            <label>
+              Адрес установки: <input value={boxParams.address} onChange={e => setBoxParams({ ...boxParams, address: e.target.value })} />
+            </label>
+          </div>
+          <div style={{ marginBottom: '15px' }}>
+            <label>
+              Место установки: <input value={boxParams.place} onChange={e => setBoxParams({ ...boxParams, place: e.target.value })} />
+            </label>
+          </div>
+          <button onClick={handleSaveBox} style={{ padding: '8px 15px', cursor: 'pointer' }}>Сохранить</button>
+          <button onClick={() => {
+            setNewBoxPosition(null); // Сбросить позицию
+            setAddBoxMode(false);   // Выйти из режима добавления
+            setBoxParams({ number: "", address: "", place: "" }); // Очистить поля
+          }} style={{ marginLeft: '10px', padding: '8px 15px', cursor: 'pointer', background: '#ccc' }}>Отмена</button> {/* Добавил кнопку Отмена */}
+        </div>
+      )}
+
+      {/* Временная таблица для проверки параметров кабелей */}
+      {/* Таблица кабелей полностью удалена */}
+    </div>
+
+    {/* Добавить отображение деталей муфты */}
+    {showSpliceClosureDetails && selectedElement?.type === 'spliceClosure' && (
+      <SpliceClosureDetailDialog
+        spliceClosure={spliceClosures.find(sc => sc.id === selectedElement.id) || null}
+        onClose={() => setShowSpliceClosureDetails(false)}
+        cables={cables}
+        spliceClosures={spliceClosures}
+        fiberConnections={fiberConnections}
+        selectedConnectionPoint={selectedConnectionPoint}
+        onConnectionPointClick={handleConnectionPointClick}
+        onRemoveFiberConnection={handleRemoveFiberConnection}
+        onUpdateSpliceClosureSplitters={handleUpdateSpliceClosureSplitters}
+        onUpdateSpliceClosureInternalConnections={handleUpdateSpliceClosureInternalConnections}
+      />
+    )}
+
+    {/* Добавить диалог для создания муфты */}
+    {newSpliceClosurePosition && addSpliceClosureMode && (
+      <div style={{
+        position: 'fixed',
+        top: '50%',
+        left: '50%',
+        transform: 'translate(-50%, -50%)',
+        background: 'white',
+        padding: '20px',
+        border: '1px solid #ccc',
+        borderRadius: '4px',
+        boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
+        zIndex: 4000
+      }}>
+        <h3 style={{ marginTop: 0, marginBottom: '15px' }}>Параметры муфты</h3>
+        <div style={{ marginBottom: '10px' }}>
+          <label>
+            Номер муфты: <input value={spliceClosureParams.number} onChange={e => setSpliceClosureParams({ ...spliceClosureParams, number: e.target.value })} />
+          </label>
+        </div>
+        <div style={{ marginBottom: '10px' }}>
+          <label>
+            Адрес установки: <input value={spliceClosureParams.address} onChange={e => setSpliceClosureParams({ ...spliceClosureParams, address: e.target.value })} />
+          </label>
+        </div>
+        <div style={{ marginBottom: '15px' }}>
+          <label>
+            Место установки: <input value={spliceClosureParams.place} onChange={e => setSpliceClosureParams({ ...spliceClosureParams, place: e.target.value })} />
+          </label>
+        </div>
+        <button onClick={handleSaveSpliceClosure} style={{ padding: '8px 15px', cursor: 'pointer' }}>Сохранить</button>
+        <button onClick={() => {
+          setNewSpliceClosurePosition(null);
+          setAddSpliceClosureMode(false);
+          setSpliceClosureParams({ number: "", address: "", place: "" });
+        }} style={{ marginLeft: '10px', padding: '8px 15px', cursor: 'pointer', background: '#ccc' }}>Отмена</button>
+      </div>
+    )}
+  </div>
+);
+}
+
+function AddSpliceClosureOnMap({ onMapClick, enabled }: { onMapClick: (pos: [number, number]) => void, enabled: boolean }) {
+  useMapEvents({
+    click(e: any) {
+      if (enabled) {
+        onMapClick([e.latlng.lat, e.latlng.lng]);
+      }
+    }
+  });
+  return null;
+}
+
+export default App;
